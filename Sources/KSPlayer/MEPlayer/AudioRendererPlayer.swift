@@ -40,9 +40,16 @@ public class AudioRendererPlayer: AudioOutput {
     private let renderer = AVSampleBufferAudioRenderer()
     private let synchronizer = AVSampleBufferRenderSynchronizer()
     private let serializationQueue = DispatchQueue(label: "ks.player.serialization.queue")
-    var isPaused: Bool {
-        synchronizer.rate == 0
-    }
+    /// Transport intent, not the timebase rate.
+    ///
+    /// The rate is legitimately 0 while playing but not yet anchored (see `anchor`), so
+    /// deriving "paused" from it would stop `request()` from ever enqueueing the first
+    /// sample — and the clock would then never start at all.
+    private var isPlaying = false
+    var isPaused: Bool { !isPlaying }
+
+    /// Whether the timebase is tied to a real media timestamp.
+    private var isAnchored = false
 
     public required init() {
         synchronizer.addRenderer(renderer)
@@ -62,28 +69,16 @@ public class AudioRendererPlayer: AudioOutput {
     }
 
     public func play() {
-        let time: CMTime
-        if #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) {
-            // 判断是否有足够的缓存，有的话就用当前的时间。seek的话，需要清空缓存，这样才能取到最新的时间。
-            if renderer.hasSufficientMediaDataForReliablePlaybackStart {
-                time = synchronizer.currentTime()
-            } else {
-                if let currentRender = renderSource?.getAudioOutputRender() {
-                    time = currentRender.cmtime
-                } else {
-                    time = .zero
-                }
-            }
-        } else {
-            if let currentRender = renderSource?.getAudioOutputRender() {
-                time = currentRender.cmtime
-            } else {
-                time = .zero
-            }
+        guard !isPlaying else {
+            return
         }
-        synchronizer.setRate(playbackRate, time: time)
-        // 要手动的调用下，这样才能及时的更新音频的时间
-        renderSource?.setAudio(time: time, position: -1)
+        isPlaying = true
+        // Resuming while the timebase is still tied to real media: carry on from where it
+        // stopped. Otherwise leave the clock stopped — `request()` starts it from the first
+        // sample it actually enqueues. Never start it from a guessed time; see `anchor`.
+        if isAnchored {
+            synchronizer.setRate(playbackRate, time: synchronizer.currentTime())
+        }
         renderer.requestMediaDataWhenReady(on: serializationQueue) { [weak self] in
             guard let self else {
                 return
@@ -91,7 +86,7 @@ public class AudioRendererPlayer: AudioOutput {
             self.request()
         }
         periodicTimeObserver = synchronizer.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.01), queue: .main) { [weak self] time in
-            guard let self else {
+            guard let self, self.isAnchored else {
                 return
             }
             self.renderSource?.setAudio(time: time, position: -1)
@@ -99,6 +94,7 @@ public class AudioRendererPlayer: AudioOutput {
     }
 
     public func pause() {
+        isPlaying = false
         synchronizer.rate = 0
         renderer.stopRequestingMediaData()
         if let periodicTimeObserver {
@@ -108,7 +104,14 @@ public class AudioRendererPlayer: AudioOutput {
     }
 
     public func flush() {
+        // Stop the clock too. A flush means the media moved (a seek, a track change), and a
+        // timebase left running would keep advancing from the old position while the renderer
+        // is empty. Samples enqueued afterwards carry the new position's timestamps, so they
+        // land outside the window the renderer will play — silence — and every consumer
+        // syncing to this clock drifts along with it.
+        synchronizer.rate = 0
         renderer.flush()
+        isAnchored = false
     }
 
     private func request() {
@@ -132,12 +135,38 @@ public class AudioRendererPlayer: AudioOutput {
                 let channelCount = render.audioFormat.channelCount
                 renderer.audioTimePitchAlgorithm = channelCount > 2 ? .spectral : .timeDomain
                 renderer.enqueue(sampleBuffer)
+                if !isAnchored {
+                    anchor(at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+                }
                 #if !os(macOS)
                 if AVAudioSession.sharedInstance().preferredInputNumberOfChannels != channelCount {
                     try? AVAudioSession.sharedInstance().setPreferredOutputNumberOfChannels(Int(channelCount))
                 }
                 #endif
             }
+        }
+    }
+
+    /// Ties the timebase to a real media timestamp.
+    ///
+    /// The clock must never be started from a fabricated time. Starting the synchronizer at
+    /// `.zero`, or at a stale `currentTime()` left over from before a flush, leaves it
+    /// free-running at wall-clock rate while the media sits somewhere else entirely.
+    /// Everything downstream syncs to this clock, so the video track ends up chasing a target
+    /// it can never reach — dropping, then flushing, then seeking frames indefinitely — while
+    /// the audio samples are timestamped outside the window the renderer will play and fall
+    /// silent.
+    private func anchor(at time: CMTime) {
+        guard time.isValid, time.isNumeric else {
+            return
+        }
+        isAnchored = true
+        runOnMainThread { [weak self] in
+            guard let self, self.isPlaying else {
+                return
+            }
+            self.synchronizer.setRate(self.playbackRate, time: time)
+            self.renderSource?.setAudio(time: time, position: -1)
         }
     }
 }
