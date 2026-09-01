@@ -51,6 +51,9 @@ public class AudioRendererPlayer: AudioOutput {
     /// Whether the timebase is tied to a real media timestamp.
     private var isAnchored = false
 
+    /// Where the clock stood when playback was paused. See `pause`.
+    private var pausedTime: CMTime?
+
     public required init() {
         synchronizer.addRenderer(renderer)
         if #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) {
@@ -77,7 +80,8 @@ public class AudioRendererPlayer: AudioOutput {
         // stopped. Otherwise leave the clock stopped — `request()` starts it from the first
         // sample it actually enqueues. Never start it from a guessed time; see `anchor`.
         if isAnchored {
-            let time = synchronizer.currentTime()
+            let time = pausedTime ?? synchronizer.currentTime()
+            pausedTime = nil
             synchronizer.setRate(playbackRate, time: time)
             // Push the time through at once. KSClock extrapolates from the wall clock since
             // its last update, and nothing updates it while paused, so it reports a time the
@@ -102,6 +106,14 @@ public class AudioRendererPlayer: AudioOutput {
 
     public func pause() {
         isPlaying = false
+        // Read the clock before stopping it. Dropping the rate to 0 discards the audio that
+        // was scheduled but never heard, and the timebase settles back to what the renderer
+        // actually played out. On a high latency output that is a long way behind where
+        // playback had reached — an AirPlay speaker holds most of a second. Resuming from
+        // the settled value puts the clock behind the video track, which then holds its next
+        // frame until the clock crawls back up to it: a freeze exactly as long as the output
+        // latency, every single time playback resumes.
+        pausedTime = isAnchored ? synchronizer.currentTime() : nil
         synchronizer.rate = 0
         renderer.stopRequestingMediaData()
         if let periodicTimeObserver {
@@ -119,6 +131,7 @@ public class AudioRendererPlayer: AudioOutput {
         synchronizer.rate = 0
         renderer.flush()
         isAnchored = false
+        pausedTime = nil
     }
 
     private func request() {
