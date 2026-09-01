@@ -546,7 +546,12 @@ public extension KSOptions {
             }
             #else
             // iOS 外放是会自动有空间音频功能，但是蓝牙耳机有可能没有空间音频功能或者把空间音频给关了，。所以还是需要处理。
-            if !isSpatialAudioEnabled {
+            //
+            // Spatial audio is not a reason to produce more channels than the output can
+            // take. On an iPhone speaker the session reports a maximum of 2 while spatial
+            // audio reads as enabled, so a 5.1 track was resampled to six channels and then
+            // mixed back down to two on the audio thread, every buffer, for nothing.
+            if !isSpatialAudioEnabled || maximumOutputNumberOfChannels <= 2 {
                 channelCount = minChannels
             }
             #endif
