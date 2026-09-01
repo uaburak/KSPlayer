@@ -363,7 +363,9 @@ open class KSOptions {
             // stretch means the picture is frozen waiting for the master clock. That branch
             // is otherwise silent, so a stall caused by video running ahead leaves no trace
             // at all — unlike the delay branches below.
-            if diff > 0.5 {
+            // Normal pacing never exceeds one frame interval (0.04s at 25fps), so anything
+            // past 0.1 is a real standing offset rather than the usual wait-for-next-frame.
+            if diff > 0.1 {
                 KSLog("[video] video ahead=\(diff), clock=\(desire), nextVideoTime=\(nextVideoTime), frameCount=\(frameCount)")
             }
             return (diff, .remain)
