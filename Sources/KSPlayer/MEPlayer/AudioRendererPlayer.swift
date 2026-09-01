@@ -54,18 +54,7 @@ public class AudioRendererPlayer: AudioOutput {
     public required init() {
         synchronizer.addRenderer(renderer)
         if #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) {
-            // Start the timebase when the renderer can actually produce audio, not the
-            // instant setRate is called. This clock is the master everything else syncs to,
-            // so starting it early means the video track follows a clock that is already
-            // ahead of the sound — it runs on, then takes a visible correction step once
-            // audio really begins. High latency outputs make that gap wide enough to see:
-            // an AirPlay speaker has to fill a deep buffer before the first sample is heard.
-            //
-            // This does not bring back the resume latency it was presumably set to avoid.
-            // pause() does not flush, so on resume the queue is still full and the rate
-            // change is not held at all; the wait only happens after a flush, where the
-            // queue really is empty and waiting is the correct thing to do.
-            synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
+            synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
         }
 //        if #available(tvOS 15.0, iOS 15.0, macOS 12.0, *) {
 //            renderer.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
@@ -88,7 +77,14 @@ public class AudioRendererPlayer: AudioOutput {
         // stopped. Otherwise leave the clock stopped — `request()` starts it from the first
         // sample it actually enqueues. Never start it from a guessed time; see `anchor`.
         if isAnchored {
-            synchronizer.setRate(playbackRate, time: synchronizer.currentTime())
+            let time = synchronizer.currentTime()
+            synchronizer.setRate(playbackRate, time: time)
+            // Push the time through at once. KSClock extrapolates from the wall clock since
+            // its last update, and nothing updates it while paused, so it reports a time the
+            // whole pause duration ahead of reality until the first periodic observer
+            // callback lands. The video track syncs to that, believes it is far behind and
+            // drops frames — a visible stall the moment playback resumes.
+            renderSource?.setAudio(time: time, position: -1)
         }
         renderer.requestMediaDataWhenReady(on: serializationQueue) { [weak self] in
             guard let self else {
