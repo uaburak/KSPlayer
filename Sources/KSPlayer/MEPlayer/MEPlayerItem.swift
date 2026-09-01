@@ -773,16 +773,6 @@ extension MEPlayerItem: OutputRenderSourceDelegate {
         isAudioStalled ? videoClock : audioClock
     }
 
-    /// Records both clocks and the head of the video queue at a transition.
-    ///
-    /// A stall on resume means the video track's next frame sits ahead of the master clock,
-    /// but nothing says which of the two moved to put it there. Sampling both sides at the
-    /// moment playback stops and again as it restarts answers that directly.
-    func logClockState(_ tag: String) {
-        let head = videoTrack?.outputRenderQueue.search { _ in true }.first
-        KSLog("[sync] \(tag) audioClock=\(audioClock.getTime()) videoClock=\(videoClock.getTime()) videoHead=\(head?.seconds ?? -1) frameCount=\(videoTrack?.frameCount ?? -1)")
-    }
-
     public func setVideo(time: CMTime, position: Int64) {
 //        print("[video] video interval \(CACurrentMediaTime() - videoClock.lastMediaTime) video diff \(time.seconds - videoClock.time.seconds)")
         videoClock.time = time

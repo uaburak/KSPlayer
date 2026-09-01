@@ -155,11 +155,9 @@ private extension KSMEPlayer {
             guard let self else { return }
             let isPaused = !(self.playbackState == .playing && self.loadState == .playable)
             if isPaused {
-                self.playerItem.logClockState("pause")
                 self.audioOutput.pause()
                 self.videoOutput?.pause()
             } else {
-                self.playerItem.logClockState("resume")
                 self.audioOutput.play()
                 self.videoOutput?.play()
             }
