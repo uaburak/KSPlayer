@@ -85,10 +85,26 @@ public final class MetalPlayView: UIView, VideoOutput {
 
     public func play() {
         displayLink.isPaused = false
+        setDisplayTimebaseRate(1)
     }
 
     public func pause() {
         displayLink.isPaused = true
+        setDisplayTimebaseRate(0)
+    }
+
+    /// Runs the display layer's own timebase alongside playback.
+    ///
+    /// It is created against the host clock at rate 1 and, left alone, keeps advancing while
+    /// playback is stopped. On resume every buffer already queued in the layer is then past
+    /// due and gets dropped, which shows as a brief stall shortly after playback restarts.
+    /// The drop happens inside AVSampleBufferDisplayLayer rather than in `videoClockSync`,
+    /// so it leaves nothing in the logs to point at it.
+    private func setDisplayTimebaseRate(_ rate: Double) {
+        guard let controlTimebase = displayLayer.controlTimebase else {
+            return
+        }
+        CMTimebaseSetRate(controlTimebase, rate: rate)
     }
 
     @available(*, unavailable)
