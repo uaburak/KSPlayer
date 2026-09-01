@@ -359,13 +359,6 @@ open class KSOptions {
 //        print("[video] video diff \(diff) nextVideoTime \(nextVideoTime) main \(main.time.seconds)")
         if diff >= 1 / fps / 2 {
             videoClockDelayCount = 0
-            // Holding the frame is the normal pacing mechanism, but holding it for a long
-            // stretch means the picture is frozen waiting for the master clock. That branch
-            // is otherwise silent, so a stall caused by video running ahead leaves no trace
-            // at all — unlike the delay branches below.
-            if diff > 0.5 {
-                KSLog("[video] video ahead=\(diff), clock=\(desire), nextVideoTime=\(nextVideoTime), frameCount=\(frameCount)")
-            }
             return (diff, .remain)
         } else {
             if diff < -4 / fps {
