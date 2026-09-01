@@ -54,7 +54,18 @@ public class AudioRendererPlayer: AudioOutput {
     public required init() {
         synchronizer.addRenderer(renderer)
         if #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) {
-            synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
+            // Start the timebase when the renderer can actually produce audio, not the
+            // instant setRate is called. This clock is the master everything else syncs to,
+            // so starting it early means the video track follows a clock that is already
+            // ahead of the sound — it runs on, then takes a visible correction step once
+            // audio really begins. High latency outputs make that gap wide enough to see:
+            // an AirPlay speaker has to fill a deep buffer before the first sample is heard.
+            //
+            // This does not bring back the resume latency it was presumably set to avoid.
+            // pause() does not flush, so on resume the queue is still full and the rate
+            // change is not held at all; the wait only happens after a flush, where the
+            // queue really is empty and waiting is the correct thing to do.
+            synchronizer.delaysRateChangeUntilHasSufficientMediaData = true
         }
 //        if #available(tvOS 15.0, iOS 15.0, macOS 12.0, *) {
 //            renderer.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
