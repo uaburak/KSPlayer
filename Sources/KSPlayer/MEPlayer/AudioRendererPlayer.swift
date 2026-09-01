@@ -53,6 +53,8 @@ public class AudioRendererPlayer: AudioOutput {
 
     /// Where the clock stood when playback was paused. See `pause`.
     private var pausedTime: CMTime?
+    /// Last value seen by the periodic observer, to spot backward corrections.
+    private var lastObservedTime: CMTime?
 
     public required init() {
         synchronizer.addRenderer(renderer)
@@ -82,6 +84,8 @@ public class AudioRendererPlayer: AudioOutput {
         if isAnchored {
             let time = pausedTime ?? synchronizer.currentTime()
             pausedTime = nil
+            KSLog("[audio] resume clock at \(time.seconds), settled value was \(synchronizer.currentTime().seconds)")
+            lastObservedTime = nil
             synchronizer.setRate(playbackRate, time: time)
             // Push the time through at once. KSClock extrapolates from the wall clock since
             // its last update, and nothing updates it while paused, so it reports a time the
@@ -100,6 +104,17 @@ public class AudioRendererPlayer: AudioOutput {
             guard let self, self.isAnchored else {
                 return
             }
+            // A timebase that steps backwards is a correction, not playback. Everything
+            // downstream treats this clock as monotonic, so a step back lands on the video
+            // track as "suddenly far ahead" and freezes the picture until the clock catches
+            // up again. Nothing else in the pipeline records that it happened.
+            if let last = self.lastObservedTime, time < last {
+                let backwards = (last - time).seconds
+                if backwards > 0.05 {
+                    KSLog("[audio] clock stepped back \(backwards) from \(last.seconds) to \(time.seconds)")
+                }
+            }
+            self.lastObservedTime = time
             self.renderSource?.setAudio(time: time, position: -1)
         }
     }
