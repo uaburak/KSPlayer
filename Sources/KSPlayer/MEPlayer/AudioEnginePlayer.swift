@@ -149,6 +149,12 @@ public class AudioEnginePlayer: AudioOutput {
         }
     }
 
+    /// Whether audio is meant to be running, i.e. whether `play()` was the last
+    /// of the two calls. `engine.isRunning` cannot answer this after a
+    /// configuration change, because the engine stops itself.
+    private var isPlaybackIntended = false
+    private var configurationObserver: NSObjectProtocol?
+
     public required init() {
         engine.attach(timePitch)
         if let audioUnit = engine.outputNode.audioUnit {
@@ -157,6 +163,51 @@ public class AudioEnginePlayer: AudioOutput {
         #if !os(macOS)
         outputLatency = AVAudioSession.sharedInstance().outputLatency
         #endif
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange,
+            object: engine,
+            queue: .main
+        ) { [weak self] _ in
+            self?.rebuildGraph()
+        }
+    }
+
+    deinit {
+        if let configurationObserver {
+            NotificationCenter.default.removeObserver(configurationObserver)
+        }
+    }
+
+    /// The engine lost its render graph, so it is built again.
+    ///
+    /// `AVAudioEngine` tears down every connection to its I/O nodes whenever the
+    /// hardware configuration changes, and stops itself. Deactivating and
+    /// restoring the audio session counts -- which is what happens every time an
+    /// app without the background audio mode is backgrounded and comes back.
+    ///
+    /// Nothing about that is visible from the outside: `start()` afterwards
+    /// returns no error, yet the source node is never pulled again. Playback
+    /// looks alive and is completely silent, and since no frame is rendered the
+    /// audio clock is never stamped either, so the reported position stops
+    /// moving as well. Audio only returns if something happens to rebuild the
+    /// graph by accident -- a later route change recomputing the track format,
+    /// say, which the render callback then notices -- tens of seconds later.
+    ///
+    /// Apple's remedy for this notification is to reconnect the nodes and start
+    /// the engine again. `prepare(audioFormat:)` already does exactly that; it
+    /// only has to be told that the format it is holding needs rebuilding.
+    private func rebuildGraph() {
+        guard let audioFormat = sourceNodeAudioFormat else {
+            return
+        }
+        KSLog("[audio] engine configuration changed, rebuilding the graph")
+        sourceNodeAudioFormat = nil
+        prepare(audioFormat: audioFormat)
+        // `prepare` only restarts an engine that was still running, and a
+        // configuration change has already stopped this one.
+        if isPlaybackIntended {
+            play()
+        }
     }
 
     public func prepare(audioFormat: AVAudioFormat) {
@@ -210,6 +261,7 @@ public class AudioEnginePlayer: AudioOutput {
     }
 
     public func play() {
+        isPlaybackIntended = true
         if !engine.isRunning {
             do {
                 try engine.start()
@@ -220,6 +272,7 @@ public class AudioEnginePlayer: AudioOutput {
     }
 
     public func pause() {
+        isPlaybackIntended = false
         if engine.isRunning {
             engine.pause()
         }
