@@ -47,7 +47,7 @@ class SeekView: UIView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    #if canImport(AppKit)
+    #if !canImport(UIKit)
     var backgroundColor: UIColor? {
         get {
             if let layer, let cgColor = layer.backgroundColor {
