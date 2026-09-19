@@ -773,6 +773,14 @@ extension MEPlayerItem: OutputRenderSourceDelegate {
         isAudioStalled ? videoClock : audioClock
     }
 
+    /// Coming out of a pause: both clocks are re-anchored to now.
+    ///
+    /// See `KSClock.rebase()` for why this is needed.
+    func rebaseClocks() {
+        audioClock.rebase()
+        videoClock.rebase()
+    }
+
     public func setVideo(time: CMTime, position: Int64) {
 //        print("[video] video interval \(CACurrentMediaTime() - videoClock.lastMediaTime) video diff \(time.seconds - videoClock.time.seconds)")
         videoClock.time = time

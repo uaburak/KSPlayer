@@ -676,4 +676,24 @@ public struct KSClock {
     func getTime() -> TimeInterval {
         time.seconds + CACurrentMediaTime() - lastMediaTime
     }
+
+    /// Re-anchors the clock to now, keeping the media time it already holds.
+    ///
+    /// `getTime()` advances the media position by the **wall-clock** time
+    /// elapsed since the last stamp. That only holds while the outputs are
+    /// actually rendering, because what stamps `time` is a rendered frame.
+    ///
+    /// Whenever the outputs stop -- the app goes to the background, the user
+    /// pauses, audio is interrupted, the buffer runs dry -- nothing stamps
+    /// `time` any more, yet `CACurrentMediaTime()` keeps running. The clock then
+    /// reads ahead by exactly as long as the pause lasted. On resume
+    /// `videoClockSync` takes that gap for a real lag and starts dropping
+    /// frames, dropping GOP packets and flushing the track: the picture races
+    /// forward to close a gap that never existed.
+    ///
+    /// Rebasing leaves `time` untouched and only moves the reference instant to
+    /// now, so playback continues from where the pause found it.
+    mutating func rebase() {
+        lastMediaTime = CACurrentMediaTime()
+    }
 }

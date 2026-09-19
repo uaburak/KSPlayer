@@ -158,6 +158,11 @@ private extension KSMEPlayer {
                 self.audioOutput.pause()
                 self.videoOutput?.pause()
             } else {
+                // While the outputs were stopped nothing stamped the clocks, so
+                // they now read ahead by the whole length of the pause. Anchor
+                // them to now before the outputs start, otherwise the video sync
+                // mistakes that gap for a lag and races to close it.
+                self.playerItem.rebaseClocks()
                 self.audioOutput.play()
                 self.videoOutput?.play()
             }
