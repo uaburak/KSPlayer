@@ -233,11 +233,33 @@ public class AudioRendererPlayer: AudioOutput {
     /// reality until the first periodic observer callback lands. The video track syncs to that,
     /// believes it is far behind and drops frames — a visible stall the moment playback
     /// resumes. Pushing the time through here closes that window.
+    ///
+    /// The clock is started a moment ahead of now rather than on the spot. The picture is
+    /// drawn from a display link that has only just been told to run again and takes a few
+    /// frames to deliver its first callback; a clock that starts at once has moved on by then
+    /// and the picture begins that far behind. Where the display runs at the content's own
+    /// frame rate one frame is shown per refresh, so the gap can never be made up — it stays
+    /// as a lip-sync error, grows with every further start, and is only ever cut back by
+    /// dropping frames. Started late, the clock arrives at the next frame's time with the
+    /// display link already running, and the picture is shown on the refresh it is due.
     private func start(at time: CMTime) {
         lastObservedTime = nil
-        synchronizer.setRate(playbackRate, time: time)
-        renderSource?.setAudio(time: time, position: -1)
+        guard #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) else {
+            synchronizer.setRate(playbackRate, time: time)
+            renderSource?.setAudio(time: time, position: -1)
+            return
+        }
+        let lead = CMTime(seconds: Self.startLead, preferredTimescale: 1000)
+        let hostTime = CMClockGetTime(CMClockGetHostTimeClock()) + lead
+        synchronizer.setRate(playbackRate, time: time, atHostTime: hostTime)
+        // Until then the timebase reads short of `time` by what is left of the lead.
+        let behind = CMTime(seconds: Self.startLead * Double(playbackRate), preferredTimescale: 1000)
+        renderSource?.setAudio(time: time - behind, position: -1)
     }
+
+    /// How far ahead of now the clock is started. Longer than a display link takes to resume —
+    /// a handful of refreshes, also at 24 Hz — and short enough to go unnoticed.
+    private static let startLead: TimeInterval = 0.12
 
     public func pause() {
         isPlaying = false
