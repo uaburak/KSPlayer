@@ -299,7 +299,11 @@ open class KSPlayerLayer: NSObject {
             timer.fireDate = Date.distantPast
         }
         state = player.loadState == .playable ? .bufferFinished : .buffering
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        // Only the Mac reads this. Elsewhere the system derives the state from the
+        // audio session; tvOS logs a refusal for every write.
         MPNowPlayingInfoCenter.default().playbackState = .playing
+        #endif
         if #available(tvOS 14.0, *) {
             KSPictureInPictureController.mute()
         }
@@ -311,7 +315,11 @@ open class KSPlayerLayer: NSObject {
         player.pause()
         timer.fireDate = Date.distantFuture
         state = .paused
+        #if os(macOS) || targetEnvironment(macCatalyst)
+        // Only the Mac reads this. Elsewhere the system derives the state from the
+        // audio session; tvOS logs a refusal for every write.
         MPNowPlayingInfoCenter.default().playbackState = .paused
+        #endif
         runOnMainThread {
             UIApplication.shared.isIdleTimerDisabled = false
         }
