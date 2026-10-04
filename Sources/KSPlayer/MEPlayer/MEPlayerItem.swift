@@ -80,8 +80,13 @@ public final class MEPlayerItem: Sendable {
         videoTrack?.suspendDecoding()
     }
 
-    func resumeVideoDecoding() {
-        videoTrack?.resumeDecoding()
+    func resumeVideoDecoding(whenReady handler: (() -> Void)? = nil) {
+        if let videoTrack {
+            videoTrack.resumeDecoding(whenReady: handler)
+        } else if let handler {
+            // No picture to wait for.
+            DispatchQueue.main.async(execute: handler)
+        }
     }
 
     private var state = MESourceState.idle {

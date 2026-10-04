@@ -465,8 +465,14 @@ extension KSMEPlayer: MediaPlayerProtocol {
         playerItem.suspendVideoDecoding()
     }
 
-    public func resumeVideoDecoding() {
-        playerItem.resumeVideoDecoding()
+    /// - Parameter handler: called on the main queue, after this call has returned, once the
+    ///   rebuilt decoder has caught up with what had been shown — at once if there is nothing
+    ///   to rebuild. Start playback from here rather than straight after the call: catching
+    ///   up means decoding the GOP again from its keyframe, which can take longer than the
+    ///   frames queued before the app left last, and the sound must not start without the
+    ///   picture.
+    public func resumeVideoDecoding(whenReady handler: (() -> Void)? = nil) {
+        playerItem.resumeVideoDecoding(whenReady: handler)
     }
 
     /// Everything that decides what is seen and heard right now, in one line, for logs.

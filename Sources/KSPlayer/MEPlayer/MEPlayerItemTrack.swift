@@ -45,11 +45,22 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
     /// Where the newest frame handed on ends, in seconds: what a rebuilt decoder must not
     /// produce a second time.
     private var deliveredUntil = 0.0
-    /// Guards the two flags below, which are set on the main thread and read while decoding.
+    /// Guards the state below, which is set on the main thread and read while decoding.
     private let rebuildLock = NSCondition()
     private var isDecodingSuspended = false
     private var decoderIsLost = false
-    private var keepsGOP: Bool {
+    /// From the moment the decoding thread takes up a lost decoder until the new one stands
+    /// where the old one stood.
+    private var isCatchingUp = false
+    /// Whether a thread is there to rebuild a lost decoder without being given a packet first.
+    private var isDecodeThreadRunning = false
+    /// Who waits for that. See `resumeDecoding(whenReady:)`.
+    private var catchUpHandlers = [() -> Void]()
+    /// True while the kept packets are fed again, and when the first frame got through in
+    /// the course of it. Touched on the decoding thread alone.
+    private var isReplaying = false
+    private var caughtUpAt = 0.0
+    fileprivate var keepsGOP: Bool {
         mediaType == .video && options.isVideoDecoderRebuildable
     }
 
@@ -150,6 +161,12 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
     /// Holding the decoder back in the meantime is part of it. A packet it is given while it
     /// has no session is a packet lost, and with enough of them the GOP kept here is no longer
     /// the one playback stands in.
+    ///
+    /// Feeding the packets again takes time: a few milliseconds each, and a GOP can hold
+    /// hundreds. The frames queued before the app left cover less than a second of that.
+    /// Playback started any sooner runs out of picture while the sound goes on, and then
+    /// drops frames to catch up with it. So whoever starts playback waits for the decoder
+    /// first (`resumeDecoding(whenReady:)`).
     func suspendDecoding() {
         guard keepsGOP else { return }
         rebuildLock.lock()
@@ -159,22 +176,40 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
     }
 
     /// Decoding carries on, with a new decoder. See `suspendDecoding()`.
-    func resumeDecoding() {
+    ///
+    /// - Parameter handler: called on the main queue, never from inside this call, once the
+    ///   new decoder has produced everything the old one had handed on: from then on the
+    ///   picture keeps up with playback. Called straight away when no decoder is being
+    ///   rebuilt, or when no thread is there to rebuild it before the next packet arrives.
+    func resumeDecoding(whenReady handler: (() -> Void)? = nil) {
         rebuildLock.lock()
         let wasSuspended = isDecodingSuspended
         isDecodingSuspended = false
         if wasSuspended {
             decoderIsLost = true
         }
+        let isAwaited = (decoderIsLost || isCatchingUp) && isDecodeThreadRunning
+        if let handler, isAwaited {
+            catchUpHandlers.append(handler)
+        }
         rebuildLock.broadcast()
         rebuildLock.unlock()
-        if wasSuspended {
-            KSLog("[video] decoding resumed, the decoder is rebuilt before the next packet")
-            // The decoding thread is most likely parked in `push`, waiting for the render
-            // queue to empty by half, and playback has not started yet. Let out now, it has
-            // the decoder rebuilt and caught up while the frames already queued are shown.
-            outputRenderQueue.wake()
+        if let handler, !isAwaited {
+            DispatchQueue.main.async(execute: handler)
         }
+        if wasSuspended {
+            KSLog("[video] decoding resumed, the decoder is rebuilt now")
+            // Wherever the decoding thread is parked — most likely in `push`, waiting for
+            // the render queue to empty by half — it is let out: nothing empties that queue
+            // while playback waits for the decoder.
+            wakeDecodeThread()
+        }
+    }
+
+    /// Lets the decoding thread out of whatever queue it is waiting on. `decoderIsLost` has
+    /// been set by then, and neither queue is waited on again while it stands.
+    fileprivate func wakeDecodeThread() {
+        outputRenderQueue.wake()
     }
 
     /// Blocks the decoding thread while decoding is suspended. A seek or a shutdown ends the
@@ -191,6 +226,49 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
         rebuildLock.lock()
         rebuildLock.broadcast()
         rebuildLock.unlock()
+    }
+
+    private var isSuspended: Bool {
+        rebuildLock.lock()
+        defer { rebuildLock.unlock() }
+        return isDecodingSuspended
+    }
+
+    /// Whether the decoder has been lost and not been taken up yet. What it gives out until
+    /// then is not passed on: the new decoder produces it again.
+    fileprivate var hasLostDecoder: Bool {
+        rebuildLock.lock()
+        defer { rebuildLock.unlock() }
+        return decoderIsLost
+    }
+
+    fileprivate func decodeThreadDidBegin() {
+        rebuildLock.lock()
+        isDecodeThreadRunning = true
+        rebuildLock.unlock()
+    }
+
+    fileprivate func decodeThreadDidEnd() {
+        finishCatchUp(isThreadEnding: true)
+    }
+
+    /// Tells whoever is waiting that the picture keeps up from here on.
+    ///
+    /// Not while the decoder has been lost once more in the meantime: the rebuild that
+    /// follows answers them. A thread that ends rebuilds nothing more and answers at once.
+    private func finishCatchUp(isThreadEnding: Bool = false) {
+        rebuildLock.lock()
+        if isThreadEnding {
+            isDecodeThreadRunning = false
+        } else if decoderIsLost {
+            rebuildLock.unlock()
+            return
+        }
+        isCatchingUp = false
+        let handlers = catchUpHandlers
+        catchUpHandlers.removeAll()
+        rebuildLock.unlock()
+        handlers.forEach { DispatchQueue.main.async(execute: $0) }
     }
 
     /// The decoder has been flushed or is gone: what was kept for it means nothing any more.
@@ -228,12 +306,29 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
         gopPacketCount = gop.count
     }
 
-    private func rebuildDecoderIfLost() {
+    fileprivate func rebuildDecoderIfLost() {
+        var hasRebuilt = false
+        // Again, if it was lost once more while the packets were being fed.
+        while takeLostDecoder() {
+            rebuildDecoder()
+            hasRebuilt = true
+        }
+        if hasRebuilt {
+            finishCatchUp()
+        }
+    }
+
+    private func takeLostDecoder() -> Bool {
         rebuildLock.lock()
-        let isLost = decoderIsLost
+        defer { rebuildLock.unlock() }
+        guard decoderIsLost else { return false }
         decoderIsLost = false
-        rebuildLock.unlock()
-        guard isLost else { return }
+        isCatchingUp = true
+        return true
+    }
+
+    private func rebuildDecoder() {
+        let closed = CACurrentMediaTime()
         decoderMap.values.forEach { $0.shutdown() }
         decoderMap.removeAll()
         guard let assetTrack = gop.first?.assetTrack else {
@@ -250,12 +345,34 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
         }
         let began = CACurrentMediaTime()
         var replayed = 0
+        var halfway = 0.0
+        var slowest = (number: 0, seconds: 0.0)
+        isReplaying = true
+        caughtUpAt = 0
         for packet in gop {
-            guard state == .decoding else { break }
+            // Suspended again: the session these packets go to is being taken away.
+            guard state == .decoding, !isSuspended else { break }
+            let started = CACurrentMediaTime()
             feed(packet)
             replayed += 1
+            // Once a frame has got through, the time goes into waiting for room in the
+            // render queue, not into decoding.
+            guard caughtUpAt == 0 else { continue }
+            let ended = CACurrentMediaTime()
+            if ended - started > slowest.seconds {
+                slowest = (replayed, ended - started)
+            }
+            if replayed == (gop.count + 1) / 2 {
+                halfway = ended - began
+            }
         }
-        KSLog("[video] decoder rebuilt, \(replayed) of \(gop.count) packets replayed in \(Int((CACurrentMediaTime() - began) * 1000)) ms, frames resume after \(String(format: "%.3f", deliveredUntil))")
+        isReplaying = false
+        // Where the time goes is not the same every time: on one return the same stream took
+        // six times as long per packet as on the five before it.
+        let duration = (caughtUpAt > 0 ? caughtUpAt : CACurrentMediaTime()) - began
+        let timing = String(format: "old decoder replaced in %.0f ms, half replayed after %.0f ms, slowest packet no. %d with %.0f ms",
+                            (began - closed) * 1000, halfway * 1000, slowest.number, slowest.seconds * 1000)
+        KSLog("[video] decoder rebuilt, \(replayed) of \(gop.count) packets replayed in \(Int(duration * 1000)) ms (\(timing)), frames resume after \(String(format: "%.3f", deliveredUntil))")
     }
 
     private var lastPacketBytes = Int32(0)
@@ -319,15 +436,31 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
                 }
                 if let frame = frame as? Frame {
                     if self.keepsGOP {
+                        // The first frame the old decoder had not handed on: the new one has
+                        // caught up. Said before the wait below — with playback waiting for
+                        // exactly this, a full queue would otherwise never empty.
+                        if self.isReplaying {
+                            if self.caughtUpAt == 0 {
+                                self.caughtUpAt = CACurrentMediaTime()
+                            }
+                            self.finishCatchUp()
+                        }
                         // The thread can have been let out of `push` with the queue still
                         // full (`resumeDecoding()`).
-                        self.outputRenderQueue.waitForSpace()
+                        self.outputRenderQueue.waitForSpace(unless: { self.hasLostDecoder })
                         if self.state == .flush || self.state == .closed {
                             return
                         }
+                        // Not handed on, so not counted as delivered: it comes out again
+                        // when the packets are replayed.
+                        if self.hasLostDecoder {
+                            return
+                        }
                         self.deliveredUntil = frame.timebase.cmtime(for: frame.timestamp + frame.duration).seconds
+                        self.outputRenderQueue.push(frame, waitUnless: { self.hasLostDecoder })
+                    } else {
+                        self.outputRenderQueue.push(frame)
                     }
-                    self.outputRenderQueue.push(frame)
                     self.outputRenderQueue.fps = packet.assetTrack.nominalFrameRate
                 }
             } catch {
@@ -403,6 +536,7 @@ final class AsyncPlayerItemTrack<Frame: MEFrame>: SyncPlayerItemTrack<Frame> {
         state = .decoding
         isEndOfFile = false
         decoderMap.values.forEach { $0.decode() }
+        decodeThreadDidBegin()
         outerLoop: while !decodeOperation.isCancelled {
             switch state {
             case .idle:
@@ -417,10 +551,25 @@ final class AsyncPlayerItemTrack<Frame: MEFrame>: SyncPlayerItemTrack<Frame> {
                 forgetGOP()
                 state = .decoding
             case .decoding:
+                if keepsGOP {
+                    waitWhileSuspended()
+                    // Here as well as before each packet: someone may be waiting for the
+                    // new decoder, and the next packet can be a long time coming.
+                    if state == .decoding {
+                        autoreleasepool {
+                            rebuildDecoderIfLost()
+                        }
+                    }
+                    // A seek or a shutdown in the meantime comes first: the next packet to
+                    // arrive may already belong to where the seek went.
+                    guard state == .decoding else {
+                        continue
+                    }
+                }
                 if isEndOfFile, packetQueue.count == 0 {
                     state = .finished
                 } else {
-                    guard let packet = packetQueue.pop(wait: true), state != .flush, state != .closed else {
+                    guard let packet = nextPacket(), state != .flush, state != .closed else {
                         continue
                     }
                     waitWhileSuspended()
@@ -434,6 +583,21 @@ final class AsyncPlayerItemTrack<Frame: MEFrame>: SyncPlayerItemTrack<Frame> {
                 }
             }
         }
+        // Nobody rebuilds a decoder from here on.
+        decodeThreadDidEnd()
+    }
+
+    private func nextPacket() -> Packet? {
+        guard keepsGOP else {
+            return packetQueue.pop(wait: true)
+        }
+        // A decoder lost while the queue is empty is not left waiting for a packet.
+        return packetQueue.pop(wait: true, waitUnless: { self.hasLostDecoder })
+    }
+
+    override fileprivate func wakeDecodeThread() {
+        super.wakeDecodeThread()
+        packetQueue.wake()
     }
 
     override func seek(time: TimeInterval) {

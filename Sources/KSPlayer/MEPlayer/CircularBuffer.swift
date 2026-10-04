@@ -40,7 +40,11 @@ public class CircularBuffer<Item: ObjectQueueItem> {
         assert(_buffer.count == capacity)
     }
 
-    public func push(_ value: Item) {
+    /// - Parameter isCancelled: asked, with the buffer locked, before the caller is made to
+    ///   wait for the buffer to empty; if it says true the caller is not kept. Whoever makes
+    ///   it true calls `wake()` afterwards, and between the two no wait can be entered
+    ///   unnoticed.
+    public func push(_ value: Item, waitUnless isCancelled: (() -> Bool)? = nil) {
         condition.lock()
         defer { condition.unlock() }
         if destroyed {
@@ -70,7 +74,7 @@ public class CircularBuffer<Item: ObjectQueueItem> {
             if expanding {
                 // No more room left for another append so grow the buffer now.
                 _doubleCapacity()
-            } else {
+            } else if isCancelled?() != true {
                 condition.wait()
             }
         } else {
@@ -81,14 +85,16 @@ public class CircularBuffer<Item: ObjectQueueItem> {
         }
     }
 
-    public func pop(wait: Bool = false, where predicate: ((Item, Int) -> Bool)? = nil) -> Item? {
+    /// - Parameter isCancelled: as in `push`: asked before the caller is made to wait for an
+    ///   item, which it then is not.
+    public func pop(wait: Bool = false, where predicate: ((Item, Int) -> Bool)? = nil, waitUnless isCancelled: (() -> Bool)? = nil) -> Item? {
         condition.lock()
         defer { condition.unlock() }
         if destroyed {
             return nil
         }
         if headIndex == tailIndex {
-            if wait {
+            if wait, isCancelled?() != true {
                 condition.wait()
                 if destroyed || headIndex == tailIndex {
                     return nil
@@ -118,15 +124,18 @@ public class CircularBuffer<Item: ObjectQueueItem> {
     ///
     /// `push` waits after it has taken the last free place, not before. Whoever is let out of
     /// that wait early (`wake()`) must therefore not push again until there is room.
-    public func waitForSpace() {
+    ///
+    /// - Parameter isCancelled: ends the wait when it says true, room or no room. Asked with
+    ///   the buffer locked, as in `push`.
+    public func waitForSpace(unless isCancelled: (() -> Bool)? = nil) {
         condition.lock()
         defer { condition.unlock() }
-        while !destroyed, !expanding, _count >= maxCount {
+        while !destroyed, !expanding, _count >= maxCount, isCancelled?() != true {
             condition.wait()
         }
     }
 
-    /// Lets whoever is waiting in `push` or `waitForSpace` look again.
+    /// Lets whoever is waiting in `push`, `pop` or `waitForSpace` look again.
     public func wake() {
         condition.lock()
         condition.broadcast()
