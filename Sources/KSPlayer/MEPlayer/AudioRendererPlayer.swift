@@ -11,7 +11,10 @@ import Foundation
 public class AudioRendererPlayer: AudioOutput {
     public var playbackRate: Float = 1 {
         didSet {
-            if !isPaused {
+            // Only a clock that is already tied to the media may be driven directly. While an
+            // anchor is still owed the rate is applied together with it; setting it here would
+            // start the timebase from wherever it happens to stand. See `Anchor`.
+            if !isPaused, isClockAnchored {
                 synchronizer.rate = playbackRate
             }
         }
@@ -42,19 +45,57 @@ public class AudioRendererPlayer: AudioOutput {
     private let serializationQueue = DispatchQueue(label: "ks.player.serialization.queue")
     /// Transport intent, not the timebase rate.
     ///
-    /// The rate is legitimately 0 while playing but not yet anchored (see `anchor`), so
+    /// The rate is legitimately 0 while playing but not yet anchored (see `Anchor`), so
     /// deriving "paused" from it would stop `request()` from ever enqueueing the first
     /// sample — and the clock would then never start at all.
     private var isPlaying = false
     var isPaused: Bool { !isPlaying }
 
-    /// Whether the timebase is tied to a real media timestamp.
-    private var isAnchored = false
+    /// How the timebase relates to the media.
+    ///
+    /// The clock must never be started from a fabricated time. Starting the synchronizer at
+    /// `.zero`, or at a stale `currentTime()` left over from before a flush, leaves it
+    /// free-running at wall-clock rate while the media sits somewhere else entirely.
+    /// Everything downstream syncs to this clock, so the video track ends up chasing a target
+    /// it can never reach — dropping, then flushing, then seeking frames indefinitely — while
+    /// the audio samples are timestamped outside the window the renderer will play and fall
+    /// silent.
+    private enum Anchor {
+        /// Nothing has been enqueued since the last flush. The clock is stopped and tied to
+        /// nothing; the first buffer to arrive claims it.
+        case loose
+        /// A buffer has been enqueued and its timestamp claimed, but the clock has not been
+        /// started from it yet: the hop to the main thread is still in flight, or it arrived
+        /// to find playback paused. Whoever starts the clock next starts it from this time.
+        case claimed(CMTime)
+        /// The clock stands at real media time, running or paused.
+        case applied
+    }
+
+    /// Guards `anchor`, `anchorGeneration` and `pausedTime`: they are written from the main
+    /// thread, from the serialization queue and — through `flush` on a route change — from
+    /// whichever thread the audio session posts its notifications on.
+    private let anchorLock = NSLock()
+    private var anchor = Anchor.loose
+    /// Moved on by every flush and by every anchor claim. A scheduled anchor carries the value
+    /// it was claimed with and is dropped if the counter has moved by the time it reaches the
+    /// main thread; a buffer carries the value it was fetched under and is dropped if a flush
+    /// has moved the counter by the time it is enqueued.
+    private var anchorGeneration = 0
 
     /// Where the clock stood when playback was paused. See `pause`.
     private var pausedTime: CMTime?
     /// Last value seen by the periodic observer, to spot backward corrections.
     private var lastObservedTime: CMTime?
+
+    private var isClockAnchored: Bool {
+        anchorLock.lock()
+        defer { anchorLock.unlock() }
+        if case .applied = anchor {
+            return true
+        }
+        return false
+    }
 
     public required init() {
         synchronizer.addRenderer(renderer)
@@ -78,21 +119,32 @@ public class AudioRendererPlayer: AudioOutput {
             return
         }
         isPlaying = true
-        // Resuming while the timebase is still tied to real media: carry on from where it
-        // stopped. Otherwise leave the clock stopped — `request()` starts it from the first
-        // sample it actually enqueues. Never start it from a guessed time; see `anchor`.
-        if isAnchored {
+        anchorLock.lock()
+        let anchor = self.anchor
+        let pausedTime = self.pausedTime
+        self.pausedTime = nil
+        if case .claimed = anchor {
+            self.anchor = .applied
+        }
+        anchorLock.unlock()
+        switch anchor {
+        case .applied:
+            // Resuming while the timebase is still tied to real media: carry on from where it
+            // stopped.
             let time = pausedTime ?? synchronizer.currentTime()
-            pausedTime = nil
             KSLog("[audio] resume clock at \(time.seconds), settled value was \(synchronizer.currentTime().seconds)")
-            lastObservedTime = nil
-            synchronizer.setRate(playbackRate, time: time)
-            // Push the time through at once. KSClock extrapolates from the wall clock since
-            // its last update, and nothing updates it while paused, so it reports a time the
-            // whole pause duration ahead of reality until the first periodic observer
-            // callback lands. The video track syncs to that, believes it is far behind and
-            // drops frames — a visible stall the moment playback resumes.
-            renderSource?.setAudio(time: time, position: -1)
+            start(at: time)
+        case let .claimed(time):
+            // The first buffer after a flush was enqueued while playback was paused, so its
+            // anchor was claimed but never applied — `applyAnchor` only starts a clock that is
+            // meant to be running. The timebase still holds whatever it held before the flush;
+            // resuming from that would be starting the clock from a stale time. The claimed
+            // timestamp is where the renderer's contents actually begin.
+            start(at: time)
+        case .loose:
+            // Leave the clock stopped: `request()` starts it from the first sample it actually
+            // enqueues.
+            break
         }
         renderer.requestMediaDataWhenReady(on: serializationQueue) { [weak self] in
             guard let self else {
@@ -101,7 +153,7 @@ public class AudioRendererPlayer: AudioOutput {
             self.request()
         }
         periodicTimeObserver = synchronizer.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.01), queue: .main) { [weak self] time in
-            guard let self, self.isAnchored else {
+            guard let self, self.isClockAnchored else {
                 return
             }
             // A timebase that steps backwards is a correction, not playback. Everything
@@ -119,6 +171,19 @@ public class AudioRendererPlayer: AudioOutput {
         }
     }
 
+    /// Starts the clock at a real media time and tells the consumers at once.
+    ///
+    /// KSClock extrapolates from the wall clock since its last update, and nothing updates it
+    /// while the clock is stopped, so it reports a time the whole pause duration ahead of
+    /// reality until the first periodic observer callback lands. The video track syncs to that,
+    /// believes it is far behind and drops frames — a visible stall the moment playback
+    /// resumes. Pushing the time through here closes that window.
+    private func start(at time: CMTime) {
+        lastObservedTime = nil
+        synchronizer.setRate(playbackRate, time: time)
+        renderSource?.setAudio(time: time, position: -1)
+    }
+
     public func pause() {
         isPlaying = false
         // Read the clock before stopping it. Dropping the rate to 0 discards the audio that
@@ -128,7 +193,16 @@ public class AudioRendererPlayer: AudioOutput {
         // the settled value puts the clock behind the video track, which then holds its next
         // frame until the clock crawls back up to it: a freeze exactly as long as the output
         // latency, every single time playback resumes.
-        pausedTime = isAnchored ? synchronizer.currentTime() : nil
+        //
+        // Only a clock that stands at media time has a position worth keeping. While the
+        // anchor is merely claimed the timebase still holds its pre-flush value.
+        anchorLock.lock()
+        if case .applied = anchor {
+            pausedTime = synchronizer.currentTime()
+        } else {
+            pausedTime = nil
+        }
+        anchorLock.unlock()
         synchronizer.rate = 0
         renderer.stopRequestingMediaData()
         if let periodicTimeObserver {
@@ -144,13 +218,24 @@ public class AudioRendererPlayer: AudioOutput {
         // land outside the window the renderer will play — silence — and every consumer
         // syncing to this clock drifts along with it.
         synchronizer.rate = 0
+        // Under the lock, so that a buffer enqueued concurrently is either wholly before this
+        // flush — and thrown away with the rest, together with any anchor it claimed — or
+        // wholly after it, and then turned away by the bump below if it was fetched earlier.
+        anchorLock.lock()
         renderer.flush()
-        isAnchored = false
+        anchor = .loose
+        anchorGeneration &+= 1
         pausedTime = nil
+        anchorLock.unlock()
     }
 
     private func request() {
         while renderer.isReadyForMoreMediaData, !isPaused {
+            // Taken before the frames are fetched: a flush between here and the enqueue means
+            // they belong to the position the media has just left.
+            anchorLock.lock()
+            let generation = anchorGeneration
+            anchorLock.unlock()
             guard var render = renderSource?.getAudioOutputRender() else {
                 break
             }
@@ -169,10 +254,7 @@ public class AudioRendererPlayer: AudioOutput {
             if let sampleBuffer = render.toCMSampleBuffer() {
                 let channelCount = render.audioFormat.channelCount
                 renderer.audioTimePitchAlgorithm = channelCount > 2 ? .spectral : .timeDomain
-                renderer.enqueue(sampleBuffer)
-                if !isAnchored {
-                    anchor(at: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
-                }
+                enqueue(sampleBuffer, fetchedAt: generation)
                 #if !os(macOS)
                 if AVAudioSession.sharedInstance().preferredInputNumberOfChannels != channelCount {
                     try? AVAudioSession.sharedInstance().setPreferredOutputNumberOfChannels(Int(channelCount))
@@ -182,26 +264,54 @@ public class AudioRendererPlayer: AudioOutput {
         }
     }
 
-    /// Ties the timebase to a real media timestamp.
+    /// Enqueues one buffer and, while the timebase is still loose, claims the anchor for it.
     ///
-    /// The clock must never be started from a fabricated time. Starting the synchronizer at
-    /// `.zero`, or at a stale `currentTime()` left over from before a flush, leaves it
-    /// free-running at wall-clock rate while the media sits somewhere else entirely.
-    /// Everything downstream syncs to this clock, so the video track ends up chasing a target
-    /// it can never reach — dropping, then flushing, then seeking frames indefinitely — while
-    /// the audio samples are timestamped outside the window the renderer will play and fall
-    /// silent.
-    private func anchor(at time: CMTime) {
-        guard time.isValid, time.isNumeric else {
+    /// Everything happens under `anchorLock`, which `flush` takes as well. That makes the
+    /// ordering between the two total: a buffer is either flushed away along with the claim it
+    /// made, or it arrives after the flush and is judged against the new generation.
+    ///
+    /// - Parameter generation: `anchorGeneration` as it stood before the frames were fetched.
+    private func enqueue(_ sampleBuffer: CMSampleBuffer, fetchedAt generation: Int) {
+        let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        anchorLock.lock()
+        // The frames were pulled out of the track before a flush that has since emptied the
+        // renderer. They carry the old position's timestamps; enqueueing them now would hand
+        // the freshly loosened clock an anchor from before the seek — the very thing the flush
+        // was there to prevent. The next iteration fetches from the new position.
+        guard anchorGeneration == generation else {
+            anchorLock.unlock()
             return
         }
-        isAnchored = true
-        runOnMainThread { [weak self] in
-            guard let self, self.isPlaying else {
-                return
-            }
-            self.synchronizer.setRate(self.playbackRate, time: time)
-            self.renderSource?.setAudio(time: time, position: -1)
+        renderer.enqueue(sampleBuffer)
+        // Only a loose timebase is owed an anchor, and only a usable timestamp can be one: an
+        // unusable one claims nothing and the next buffer gets to try again.
+        guard case .loose = anchor, time.isValid, time.isNumeric else {
+            anchorLock.unlock()
+            return
         }
+        anchor = .claimed(time)
+        anchorGeneration &+= 1
+        let claim = anchorGeneration
+        anchorLock.unlock()
+        runOnMainThread { [weak self] in
+            self?.applyAnchor(claimedAt: claim)
+        }
+    }
+
+    /// Starts the clock from the claimed timestamp, provided the claim still stands.
+    ///
+    /// Two things can have happened during the hop to the main thread. A flush: the buffer
+    /// that carried the timestamp is gone and the generation has moved, so the claim is void
+    /// and the first buffer of the new position makes a fresh one. Or a pause: the claim is
+    /// still good but the clock is not meant to run, so it is left standing for `play()`.
+    private func applyAnchor(claimedAt generation: Int) {
+        anchorLock.lock()
+        guard anchorGeneration == generation, case let .claimed(time) = anchor, isPlaying else {
+            anchorLock.unlock()
+            return
+        }
+        anchor = .applied
+        anchorLock.unlock()
+        start(at: time)
     }
 }
