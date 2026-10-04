@@ -9,6 +9,15 @@ import AVFoundation
 import Foundation
 
 public class AudioRendererPlayer: AudioOutput {
+    /// How far ahead of now the clock is started; 0 starts it on the spot. See `start(at:)`.
+    public static var clockStartLead: TimeInterval = 0.12
+    /// Whether a route change throws the queue away, as it did before `outputDidChange()`
+    /// existed. Kept switchable so the two behaviours can be compared on a real output.
+    public static var flushesOnOutputChange = false
+    /// Whether every `play()` rebuilds the renderer's queue from what the output has kept,
+    /// instead of trusting the renderer to still hold it.
+    public static var resuppliesOnPlay = false
+
     public var playbackRate: Float = 1 {
         didSet {
             // Only a clock that is already tied to the media may be driven directly. While an
@@ -111,7 +120,12 @@ public class AudioRendererPlayer: AudioOutput {
     /// These are the very objects the renderer was given, so keeping them costs no second
     /// copy of the samples while the renderer still holds its own reference.
     private var pending = [Pending]()
-    private var flushObserver: NSObjectProtocol?
+    private var observers = [NSObjectProtocol]()
+    /// Bookkeeping for `diagnostics` only. Guarded by `anchorLock`.
+    private var enqueuedCount = 0
+    private var lastEnqueuedEnd = CMTime.invalid
+    private var resupplyCount = 0
+    private var automaticFlushCount = 0
     /// Last value seen by the periodic observer, to spot backward corrections.
     private var lastObservedTime: CMTime?
 
@@ -133,27 +147,93 @@ public class AudioRendererPlayer: AudioOutput {
         // route, a change of playback rate — and says so here. It expects to be given the
         // media again from where the timebase stands; nobody was listening, so the queue
         // simply stayed empty until playback reached whatever came after it.
-        flushObserver = NotificationCenter.default.addObserver(
+        observers.append(NotificationCenter.default.addObserver(
             forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
             object: renderer,
             queue: nil
-        ) { [weak self] _ in
+        ) { [weak self] notification in
+            let flushTime = (notification.userInfo?[AVSampleBufferAudioRendererFlushTimeKey] as? NSValue)?.timeValue
             // Not on the posting thread: nothing says the renderer cannot post this from
             // inside a call that was made with `anchorLock` held.
             self?.serializationQueue.async { [weak self] in
-                KSLog("[audio] renderer was flushed automatically, re-supplying")
-                self?.resupply()
+                guard let self else { return }
+                self.anchorLock.lock()
+                self.automaticFlushCount += 1
+                self.anchorLock.unlock()
+                KSLog("[audio] AUTOMATIC FLUSH by the renderer, flushTime=\(flushTime?.seconds ?? -1) | \(self.diagnostics)")
+                self.resupply(reason: "automatic flush")
             }
+        })
+        if #available(macOS 12.0, iOS 15.0, tvOS 15.0, *) {
+            observers.append(NotificationCenter.default.addObserver(
+                forName: .AVSampleBufferAudioRendererOutputConfigurationDidChange,
+                object: renderer,
+                queue: nil
+            ) { [weak self] _ in
+                self?.serializationQueue.async { [weak self] in
+                    guard let self else { return }
+                    KSLog("[audio] renderer output configuration changed | \(self.diagnostics)")
+                }
+            })
         }
+        // The rate can move without anyone here asking for it: the system stops the
+        // synchronizer on an interruption.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: AVSampleBufferRenderSynchronizer.rateDidChangeNotification,
+            object: synchronizer,
+            queue: nil
+        ) { [weak self] _ in
+            self?.serializationQueue.async { [weak self] in
+                guard let self else { return }
+                KSLog("[audio] synchronizer rate changed to \(self.synchronizer.rate) at \(self.synchronizer.currentTime().seconds), wanted \(self.isPlaying ? "playing" : "paused")")
+            }
+        })
+        KSLog("[audio] AudioRendererPlayer created, lead=\(Self.clockStartLead) flushesOnOutputChange=\(Self.flushesOnOutputChange) resuppliesOnPlay=\(Self.resuppliesOnPlay)")
 //        if #available(tvOS 15.0, iOS 15.0, macOS 12.0, *) {
 //            renderer.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
 //        }
     }
 
     deinit {
-        if let flushObserver {
-            NotificationCenter.default.removeObserver(flushObserver)
+        observers.forEach(NotificationCenter.default.removeObserver)
+    }
+
+    /// The state of the output in one line, for logs.
+    public var diagnostics: String {
+        anchorLock.lock()
+        let anchorText: String
+        switch anchor {
+        case .loose: anchorText = "loose"
+        case let .claimed(time): anchorText = "claimed(\(Self.text(time)))"
+        case .applied: anchorText = "applied"
         }
+        let paused = pausedTime
+        let count = pending.count
+        let first = pending.first.map { CMSampleBufferGetPresentationTimeStamp($0.buffer) }
+        let last = pending.last?.end
+        let enqueued = enqueuedCount
+        let lastEnd = lastEnqueuedEnd
+        let resupplies = resupplyCount
+        let flushes = automaticFlushCount
+        anchorLock.unlock()
+        let clock = synchronizer.currentTime()
+        var text = "want=\(isPlaying ? "play" : "pause") anchor=\(anchorText) rate=\(synchronizer.rate)"
+        text += " tbRate=\(CMTimebaseGetRate(synchronizer.timebase)) clock=\(Self.text(clock))"
+        text += " paused=\(paused.map(Self.text) ?? "-")"
+        text += " status=\(renderer.status.rawValue) error=\(renderer.error.map { "\(($0 as NSError).domain)#\(($0 as NSError).code)" } ?? "-")"
+        text += " ready=\(renderer.isReadyForMoreMediaData)"
+        if #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) {
+            text += " sufficient=\(renderer.hasSufficientMediaDataForReliablePlaybackStart)"
+        }
+        text += " kept=\(count)[\(first.map(Self.text) ?? "-")..\(last.map(Self.text) ?? "-")]"
+        text += " ahead=\(lastEnd.isNumeric ? String(format: "%.2f", (lastEnd - clock).seconds) : "-")"
+        text += " enqueued=\(enqueued) resupplied=\(resupplies) autoFlush=\(flushes)"
+        text += " vol=\(renderer.volume) muted=\(renderer.isMuted)"
+        return text
+    }
+
+    private static func text(_ time: CMTime) -> String {
+        time.isNumeric ? String(format: "%.3f", time.seconds) : "invalid"
     }
 
     public func prepare(audioFormat: AVAudioFormat) {
@@ -168,11 +248,13 @@ public class AudioRendererPlayer: AudioOutput {
             return
         }
         isPlaying = true
+        KSLog("[audio] play() | \(diagnostics)")
         // The renderer can fail while playback stands still — being put in the background is
         // enough on some outputs — and a failed renderer plays nothing until it is flushed.
         if renderer.status == .failed {
-            KSLog("[audio] renderer failed: \(String(describing: renderer.error)), re-supplying")
-            resupply()
+            resupply(reason: "failed at play: \(String(describing: renderer.error))")
+        } else if Self.resuppliesOnPlay {
+            resupply(reason: "resuppliesOnPlay")
         }
         anchorLock.lock()
         let anchor = self.anchor
@@ -199,7 +281,7 @@ public class AudioRendererPlayer: AudioOutput {
         case .loose:
             // Leave the clock stopped: `request()` starts it from the first sample it actually
             // enqueues.
-            break
+            KSLog("[audio] play() with a loose anchor: the clock waits for the first buffer")
         }
         renderer.requestMediaDataWhenReady(on: serializationQueue) { [weak self] in
             guard let self else {
@@ -215,10 +297,12 @@ public class AudioRendererPlayer: AudioOutput {
             // downstream treats this clock as monotonic, so a step back lands on the video
             // track as "suddenly far ahead" and freezes the picture until the clock catches
             // up again. Nothing else in the pipeline records that it happened.
-            if let last = self.lastObservedTime, time < last {
-                let backwards = (last - time).seconds
-                if backwards > 0.05 {
-                    KSLog("[audio] clock stepped back \(backwards) from \(last.seconds) to \(time.seconds)")
+            if let last = self.lastObservedTime {
+                let step = (time - last).seconds
+                if step < -0.05 {
+                    KSLog("[audio] clock stepped back \(-step) from \(last.seconds) to \(time.seconds)")
+                } else if step > 0.5 {
+                    KSLog("[audio] clock stepped forward \(step) from \(last.seconds) to \(time.seconds)")
                 }
             }
             self.lastObservedTime = time
@@ -244,22 +328,22 @@ public class AudioRendererPlayer: AudioOutput {
     /// display link already running, and the picture is shown on the refresh it is due.
     private func start(at time: CMTime) {
         lastObservedTime = nil
-        guard #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) else {
+        let before = synchronizer.currentTime()
+        let leadSeconds = Self.clockStartLead
+        guard leadSeconds > 0, #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) else {
             synchronizer.setRate(playbackRate, time: time)
             renderSource?.setAudio(time: time, position: -1)
+            KSLog("[audio] CLOCK START at \(Self.text(time)) now, was \(Self.text(before)), reads \(Self.text(synchronizer.currentTime())) rate=\(synchronizer.rate)")
             return
         }
-        let lead = CMTime(seconds: Self.startLead, preferredTimescale: 1000)
+        let lead = CMTime(seconds: leadSeconds, preferredTimescale: 1000)
         let hostTime = CMClockGetTime(CMClockGetHostTimeClock()) + lead
         synchronizer.setRate(playbackRate, time: time, atHostTime: hostTime)
         // Until then the timebase reads short of `time` by what is left of the lead.
-        let behind = CMTime(seconds: Self.startLead * Double(playbackRate), preferredTimescale: 1000)
+        let behind = CMTime(seconds: leadSeconds * Double(playbackRate), preferredTimescale: 1000)
         renderSource?.setAudio(time: time - behind, position: -1)
+        KSLog("[audio] CLOCK START at \(Self.text(time)) in \(leadSeconds)s, was \(Self.text(before)), reads \(Self.text(synchronizer.currentTime())) rate=\(synchronizer.rate)")
     }
-
-    /// How far ahead of now the clock is started. Longer than a display link takes to resume —
-    /// a handful of refreshes, also at 24 Hz — and short enough to go unnoticed.
-    private static let startLead: TimeInterval = 0.12
 
     public func pause() {
         isPlaying = false
@@ -282,6 +366,7 @@ public class AudioRendererPlayer: AudioOutput {
         anchorLock.unlock()
         synchronizer.rate = 0
         renderer.stopRequestingMediaData()
+        KSLog("[audio] pause() | \(diagnostics)")
         if let periodicTimeObserver {
             synchronizer.removeTimeObserver(periodicTimeObserver)
             self.periodicTimeObserver = nil
@@ -294,6 +379,7 @@ public class AudioRendererPlayer: AudioOutput {
         // is empty. Samples enqueued afterwards carry the new position's timestamps, so they
         // land outside the window the renderer will play — silence — and every consumer
         // syncing to this clock drifts along with it.
+        KSLog("[audio] FLUSH (media moved) on \(Thread.isMainThread ? "main" : "background") thread | \(diagnostics)")
         synchronizer.rate = 0
         // Under the lock, so that a buffer enqueued concurrently is either wholly before this
         // flush — and thrown away with the rest, together with any anchor it claimed — or
@@ -315,16 +401,25 @@ public class AudioRendererPlayer: AudioOutput {
     /// top of that — which is what every route change used to do — discarded the queue with
     /// nothing to refill it from, and a route change is exactly what the audio session
     /// reports when an app returns from the background.
-    public func outputDidChange() {}
+    public func outputDidChange() {
+        if Self.flushesOnOutputChange {
+            flush()
+        } else {
+            KSLog("[audio] output changed, queue kept | \(diagnostics)")
+        }
+    }
 
     /// Gives the renderer back what it no longer holds, without moving the media.
     ///
     /// The clock is left alone: it stands, or keeps running, where the media is, and the
     /// buffers handed back carry the timestamps they always had. The renderer picks up at the
     /// clock's position, so all that is heard is the moment it needs to start again.
-    private func resupply() {
+    public func resupply() {
+        resupply(reason: "requested")
+    }
+
+    private func resupply(reason: String) {
         anchorLock.lock()
-        defer { anchorLock.unlock() }
         // Clears a failed status as well, and anything enqueued since the queue was lost:
         // the renderer takes buffers in presentation order only.
         renderer.flush()
@@ -332,6 +427,9 @@ public class AudioRendererPlayer: AudioOutput {
         for item in pending {
             renderer.enqueue(item.buffer)
         }
+        resupplyCount += 1
+        anchorLock.unlock()
+        KSLog("[audio] RESUPPLY (\(reason)) | \(diagnostics)")
     }
 
     /// Lets go of the buffers the clock has passed. `anchorLock` must be held.
@@ -350,8 +448,7 @@ public class AudioRendererPlayer: AudioOutput {
     private func request() {
         // A failed renderer takes nothing more until it is flushed, and what it held is gone.
         if renderer.status == .failed {
-            KSLog("[audio] renderer failed: \(String(describing: renderer.error)), re-supplying")
-            resupply()
+            resupply(reason: "failed in request: \(String(describing: renderer.error))")
         }
         while renderer.isReadyForMoreMediaData, !isPaused {
             // Taken before the frames are fetched: a flush between here and the enqueue means
@@ -414,7 +511,9 @@ public class AudioRendererPlayer: AudioOutput {
         let end = time + duration
         if end.isNumeric {
             pending.append(Pending(buffer: sampleBuffer, end: end))
+            lastEnqueuedEnd = end
         }
+        enqueuedCount += 1
         // Only a loose timebase is owed an anchor, and only a usable timestamp can be one: an
         // unusable one claims nothing and the next buffer gets to try again.
         guard case .loose = anchor, time.isValid, time.isNumeric else {
@@ -425,6 +524,7 @@ public class AudioRendererPlayer: AudioOutput {
         anchorGeneration &+= 1
         let claim = anchorGeneration
         anchorLock.unlock()
+        KSLog("[audio] anchor claimed at \(Self.text(time)) by the first buffer after a flush")
         runOnMainThread { [weak self] in
             self?.applyAnchor(claimedAt: claim)
         }
@@ -440,6 +540,7 @@ public class AudioRendererPlayer: AudioOutput {
         anchorLock.lock()
         guard anchorGeneration == generation, case let .claimed(time) = anchor, isPlaying else {
             anchorLock.unlock()
+            KSLog("[audio] anchor claim not applied: superseded or paused")
             return
         }
         anchor = .applied

@@ -83,12 +83,33 @@ public final class MetalPlayView: UIView, VideoOutput {
         pause()
     }
 
+    /// When the display link was last told to run; cleared by its first callback after that.
+    private var resumedAt: CFTimeInterval?
+    private var renderedCount = 0
+
     public func play() {
+        if displayLink.isPaused {
+            resumedAt = CACurrentMediaTime()
+        }
         displayLink.isPaused = false
     }
 
     public func pause() {
         displayLink.isPaused = true
+    }
+
+    /// The state of the display, for logs.
+    var diagnostics: String {
+        var text = "link=\(displayLink.isPaused ? "paused" : "running") drawn=\(renderedCount) fps=\(fps)"
+        let layer = displayView.displayLayer
+        text += " layer=\(displayView.isHidden ? "metal" : "display") status=\(layer.status.rawValue)"
+        if let error = layer.error as NSError? {
+            text += " error=\(error.domain)#\(error.code)"
+        }
+        if #available(macOS 11.0, iOS 14, tvOS 14, *) {
+            text += " needsFlush=\(layer.requiresFlushToResumeDecoding)"
+        }
+        return text
     }
 
     @available(*, unavailable)
@@ -165,6 +186,10 @@ public final class MetalPlayView: UIView, VideoOutput {
 
 extension MetalPlayView {
     @objc private func renderFrame() {
+        if let resumedAt {
+            self.resumedAt = nil
+            KSLog("[video] first display link callback \(String(format: "%.0f", (CACurrentMediaTime() - resumedAt) * 1000)) ms after play()")
+        }
         draw(force: false)
     }
 
@@ -218,6 +243,7 @@ extension MetalPlayView {
                 metalView.draw(pixelBuffer: pixelBuffer, display: options.display, size: size)
             }
             renderSource?.setVideo(time: cmtime, position: frame.position)
+            renderedCount &+= 1
         }
     }
 

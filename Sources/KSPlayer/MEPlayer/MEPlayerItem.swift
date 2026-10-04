@@ -52,14 +52,31 @@ public final class MEPlayerItem: Sendable {
     public private(set) var naturalSize = CGSize.zero
     private var error: NSError? {
         didSet {
-            if error != nil {
+            if let error {
+                KSLog("[item] error \(error.domain)#\(error.code) \(error.localizedDescription)")
                 state = .failed
             }
         }
     }
 
+    /// Clocks, source state and how much each track holds, for logs.
+    var diagnostics: String {
+        var text = "state=\(state) main=\(isAudioStalled ? "video" : "audio")"
+        text += String(format: " aClock=%.3f(+%.3f) vClock=%.3f(+%.3f)",
+                       audioClock.time.seconds, CACurrentMediaTime() - audioClock.lastMediaTime,
+                       videoClock.time.seconds, CACurrentMediaTime() - videoClock.lastMediaTime)
+        text += " first=\(isFirst) seek=\(isSeek)"
+        for track in videoAudioTracks {
+            text += " \(track.mediaType == .audio ? "a" : "v")[frames=\(track.frameCount)/\(track.frameMaxCount) packets=\(track.packetCount) eof=\(track.isEndOfFile)]"
+        }
+        return text
+    }
+
     private var state = MESourceState.idle {
         didSet {
+            if state != oldValue {
+                KSLog("[item] state \(oldValue) -> \(state)")
+            }
             switch state {
             case .opened:
                 delegate?.sourceDidOpened()
@@ -566,6 +583,7 @@ extension MEPlayerItem {
                 }
             }
         } else {
+            KSLog("[item] read returned \(readResult), eof=\(readResult == AVError.eof.code || avio_feof(formatCtx?.pointee.pb) > 0)")
             if readResult == AVError.eof.code || avio_feof(formatCtx?.pointee.pb) > 0 {
                 if options.isLoopPlay, allPlayerItemTracks.allSatisfy({ !$0.isLoopModel }) {
                     allPlayerItemTracks.forEach { $0.isLoopModel = true }
@@ -676,6 +694,7 @@ extension MEPlayerItem: MediaPlayback {
     }
 
     public func seek(time: TimeInterval, completion: @escaping ((Bool) -> Void)) {
+        KSLog("[item] seek to \(time) requested in state \(state)")
         if state == .reading || state == .paused {
             seekTime = time
             state = .seeking

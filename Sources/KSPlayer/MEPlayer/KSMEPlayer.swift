@@ -95,6 +95,7 @@ public class KSMEPlayer: NSObject {
     public private(set) var loadState = MediaLoadState.idle {
         didSet {
             if loadState != oldValue {
+                KSLog("[player] loadState \(oldValue) -> \(loadState) at \(currentPlaybackTime)")
                 playOrPause()
             }
         }
@@ -103,6 +104,7 @@ public class KSMEPlayer: NSObject {
     public private(set) var playbackState = MediaPlaybackState.idle {
         didSet {
             if playbackState != oldValue {
+                KSLog("[player] playbackState \(oldValue) -> \(playbackState) at \(currentPlaybackTime)")
                 playOrPause()
                 if playbackState == .finished {
                     runOnMainThread { [weak self] in
@@ -154,6 +156,7 @@ private extension KSMEPlayer {
         runOnMainThread { [weak self] in
             guard let self else { return }
             let isPaused = !(self.playbackState == .playing && self.loadState == .playable)
+            KSLog("[player] outputs \(isPaused ? "stop" : "start") (playback=\(self.playbackState) load=\(self.loadState))")
             if isPaused {
                 self.audioOutput.pause()
                 self.videoOutput?.pause()
@@ -183,6 +186,7 @@ private extension KSMEPlayer {
         guard let reason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt else {
             return
         }
+        KSLog("[player] audio route change, reason=\(reason) on \(Thread.isMainThread ? "main" : "background") thread")
 //        let routeChangeReason = AVAudioSession.RouteChangeReason(rawValue: reason)
 //        guard [AVAudioSession.RouteChangeReason.newDeviceAvailable, .oldDeviceUnavailable, .routeConfigurationChange].contains(routeChangeReason) else {
 //            return
@@ -359,6 +363,7 @@ extension KSMEPlayer: MediaPlayerProtocol {
 
     public func seek(time: TimeInterval, completion: @escaping ((Bool) -> Void)) {
         let time = max(time, 0)
+        KSLog("[player] seek to \(time) from \(currentPlaybackTime)")
         playbackState = .seeking
         runOnMainThread { [weak self] in
             self?.bufferingProgress = 0
@@ -371,6 +376,7 @@ extension KSMEPlayer: MediaPlayerProtocol {
         }
         playerItem.seek(time: seekTime) { [weak self] result in
             guard let self else { return }
+            KSLog("[player] seek to \(seekTime) finished, success=\(result)")
             if result {
                 self.audioOutput.flush()
                 runOnMainThread { [weak self] in
@@ -447,6 +453,21 @@ extension KSMEPlayer: MediaPlayerProtocol {
     public func enterBackground() {}
 
     public func enterForeground() {}
+
+    /// Everything that decides what is seen and heard right now, in one line, for logs.
+    public var diagnostics: String {
+        var text = "playback=\(playbackState) load=\(loadState) pos=\(String(format: "%.3f", currentPlaybackTime)) playable=\(String(format: "%.1f", playableTime))"
+        text += " | item: \(playerItem.diagnostics)"
+        if let audio = audioOutput as? AudioRendererPlayer {
+            text += " | renderer: \(audio.diagnostics)"
+        } else {
+            text += " | audio: \(type(of: audioOutput))"
+        }
+        if let video = videoOutput as? MetalPlayView {
+            text += " | video: \(video.diagnostics)"
+        }
+        return text
+    }
 
     public var isMuted: Bool {
         get {

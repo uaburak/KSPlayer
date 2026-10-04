@@ -277,6 +277,7 @@ open class KSPlayerLayer: NSObject {
     }
 
     open func play() {
+        KSLog("[layer] play(), state=\(state) ready=\(player.isReadyToPlay) playback=\(player.playbackState) load=\(player.loadState)")
         runOnMainThread {
             UIApplication.shared.isIdleTimerDisabled = true
         }
@@ -305,6 +306,7 @@ open class KSPlayerLayer: NSObject {
     }
 
     open func pause() {
+        KSLog("[layer] pause(), state=\(state) playback=\(player.playbackState) load=\(player.loadState)")
         isAutoPlay = false
         player.pause()
         timer.fireDate = Date.distantFuture
@@ -442,6 +444,7 @@ extension KSPlayerLayer: MediaPlayerDelegate {
     }
 
     public func finish(player: some MediaPlayerProtocol, error: Error?) {
+        KSLog("[layer] finish, error=\(error.map { "\(($0 as NSError).domain)#\(($0 as NSError).code)" } ?? "none") at \(player.currentPlaybackTime)")
         if let error {
             if type(of: player) != KSOptions.secondPlayerType, let secondPlayerType = KSOptions.secondPlayerType {
                 self.player = secondPlayerType.init(url: url, options: options)
@@ -645,6 +648,7 @@ extension KSPlayerLayer {
     }
 
     @objc private func enterBackground() {
+        KSLog("[layer] enterBackground, state=\(state) playback=\(player.playbackState) load=\(player.loadState)")
         guard state.isPlaying, !player.isExternalPlaybackActive else {
             return
         }
@@ -660,6 +664,7 @@ extension KSPlayerLayer {
     }
 
     @objc private func enterForeground() {
+        KSLog("[layer] enterForeground, state=\(state) playback=\(player.playbackState) load=\(player.loadState)")
         if KSOptions.canBackgroundPlay {
             player.enterForeground()
         }
@@ -686,6 +691,7 @@ extension KSPlayerLayer {
         else {
             return
         }
+        KSLog("[layer] audio interruption type=\(typeValue) info=\(userInfo.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: " "))")
         switch type {
         case .began:
             pause()
