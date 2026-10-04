@@ -190,7 +190,7 @@ private extension KSMEPlayer {
         for track in tracks(mediaType: .audio) {
             (track as? FFmpegAssetTrack)?.audioDescriptor?.updateAudioFormat()
         }
-        audioOutput.flush()
+        audioOutput.outputDidChange()
     }
     #endif
 }

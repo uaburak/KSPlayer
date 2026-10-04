@@ -14,6 +14,19 @@ public protocol AudioOutput: FrameOutput {
     var isMuted: Bool { get set }
     init()
     func prepare(audioFormat: AVAudioFormat)
+    /// The audio route changed underneath the output; the media is where it was.
+    ///
+    /// Not the same thing as `flush()`, which says the media moved and everything queued for
+    /// the old position is to be thrown away.
+    func outputDidChange()
+}
+
+public extension AudioOutput {
+    /// The outputs that pull one frame at a time hold next to nothing, so starting over on
+    /// the frame in hand is all a route change asks of them.
+    func outputDidChange() {
+        flush()
+    }
 }
 
 public protocol AudioDynamicsProcessor {

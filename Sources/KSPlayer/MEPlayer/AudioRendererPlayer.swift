@@ -85,6 +85,33 @@ public class AudioRendererPlayer: AudioOutput {
 
     /// Where the clock stood when playback was paused. See `pause`.
     private var pausedTime: CMTime?
+
+    /// A buffer the renderer has been given, and the media time at which it ends.
+    private struct Pending {
+        let buffer: CMSampleBuffer
+        let end: CMTime
+    }
+
+    /// Every buffer handed to the renderer that the clock has not passed yet, oldest first.
+    /// Guarded by `anchorLock`.
+    ///
+    /// The renderer keeps a queue of its own and `request()` feeds it for as long as it will
+    /// take more, so it runs ahead of playback by however much the output is willing to hold:
+    /// about a second on a local output, and on a buffered AirPlay route evidently most of
+    /// the forward buffer — returning from the background there skipped twenty to forty-five
+    /// seconds. All of that has already been taken out of the track, and the track cannot
+    /// produce the same frames a second time.
+    ///
+    /// So when the renderer loses its queue while the media stays where it is, what it held
+    /// has to come from here. Without this list the next buffer to arrive is the one after
+    /// everything that was lost: the clock re-anchors to it and leaps forward by the depth of
+    /// the lost queue, the sound skips that far ahead, and the picture drops frames and whole
+    /// GOPs until it has caught up with a clock that jumped.
+    ///
+    /// These are the very objects the renderer was given, so keeping them costs no second
+    /// copy of the samples while the renderer still holds its own reference.
+    private var pending = [Pending]()
+    private var flushObserver: NSObjectProtocol?
     /// Last value seen by the periodic observer, to spot backward corrections.
     private var lastObservedTime: CMTime?
 
@@ -102,9 +129,31 @@ public class AudioRendererPlayer: AudioOutput {
         if #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) {
             synchronizer.delaysRateChangeUntilHasSufficientMediaData = false
         }
+        // The renderer empties its queue on its own when the output under it changes — a new
+        // route, a change of playback rate — and says so here. It expects to be given the
+        // media again from where the timebase stands; nobody was listening, so the queue
+        // simply stayed empty until playback reached whatever came after it.
+        flushObserver = NotificationCenter.default.addObserver(
+            forName: .AVSampleBufferAudioRendererWasFlushedAutomatically,
+            object: renderer,
+            queue: nil
+        ) { [weak self] _ in
+            // Not on the posting thread: nothing says the renderer cannot post this from
+            // inside a call that was made with `anchorLock` held.
+            self?.serializationQueue.async { [weak self] in
+                KSLog("[audio] renderer was flushed automatically, re-supplying")
+                self?.resupply()
+            }
+        }
 //        if #available(tvOS 15.0, iOS 15.0, macOS 12.0, *) {
 //            renderer.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
 //        }
+    }
+
+    deinit {
+        if let flushObserver {
+            NotificationCenter.default.removeObserver(flushObserver)
+        }
     }
 
     public func prepare(audioFormat: AVAudioFormat) {
@@ -119,6 +168,12 @@ public class AudioRendererPlayer: AudioOutput {
             return
         }
         isPlaying = true
+        // The renderer can fail while playback stands still — being put in the background is
+        // enough on some outputs — and a failed renderer plays nothing until it is flushed.
+        if renderer.status == .failed {
+            KSLog("[audio] renderer failed: \(String(describing: renderer.error)), re-supplying")
+            resupply()
+        }
         anchorLock.lock()
         let anchor = self.anchor
         let pausedTime = self.pausedTime
@@ -226,15 +281,62 @@ public class AudioRendererPlayer: AudioOutput {
         anchor = .loose
         anchorGeneration &+= 1
         pausedTime = nil
+        // The media has moved: what the renderer held belongs to the position it left.
+        pending.removeAll()
         anchorLock.unlock()
     }
 
+    /// The route changed; the media did not move.
+    ///
+    /// Nothing is thrown away here. The renderer follows a route change by itself, and when
+    /// that costs it its queue it posts the notification `resupply()` answers. Flushing on
+    /// top of that — which is what every route change used to do — discarded the queue with
+    /// nothing to refill it from, and a route change is exactly what the audio session
+    /// reports when an app returns from the background.
+    public func outputDidChange() {}
+
+    /// Gives the renderer back what it no longer holds, without moving the media.
+    ///
+    /// The clock is left alone: it stands, or keeps running, where the media is, and the
+    /// buffers handed back carry the timestamps they always had. The renderer picks up at the
+    /// clock's position, so all that is heard is the moment it needs to start again.
+    private func resupply() {
+        anchorLock.lock()
+        defer { anchorLock.unlock() }
+        // Clears a failed status as well, and anything enqueued since the queue was lost:
+        // the renderer takes buffers in presentation order only.
+        renderer.flush()
+        dropPlayed()
+        for item in pending {
+            renderer.enqueue(item.buffer)
+        }
+    }
+
+    /// Lets go of the buffers the clock has passed. `anchorLock` must be held.
+    private func dropPlayed() {
+        // Only a clock tied to the media says anything about what has been played.
+        guard case .applied = anchor, !pending.isEmpty else {
+            return
+        }
+        let position = pausedTime ?? synchronizer.currentTime()
+        let played = pending.prefix { $0.end <= position }.count
+        if played > 0 {
+            pending.removeFirst(played)
+        }
+    }
+
     private func request() {
+        // A failed renderer takes nothing more until it is flushed, and what it held is gone.
+        if renderer.status == .failed {
+            KSLog("[audio] renderer failed: \(String(describing: renderer.error)), re-supplying")
+            resupply()
+        }
         while renderer.isReadyForMoreMediaData, !isPaused {
             // Taken before the frames are fetched: a flush between here and the enqueue means
             // they belong to the position the media has just left.
             anchorLock.lock()
             let generation = anchorGeneration
+            dropPlayed()
             anchorLock.unlock()
             guard var render = renderSource?.getAudioOutputRender() else {
                 break
@@ -254,7 +356,9 @@ public class AudioRendererPlayer: AudioOutput {
             if let sampleBuffer = render.toCMSampleBuffer() {
                 let channelCount = render.audioFormat.channelCount
                 renderer.audioTimePitchAlgorithm = channelCount > 2 ? .spectral : .timeDomain
-                enqueue(sampleBuffer, fetchedAt: generation)
+                // The buffer itself carries no duration (see `toCMSampleBuffer`).
+                let duration = CMTime(value: CMTimeValue(render.numberOfSamples), timescale: CMTimeScale(render.audioFormat.sampleRate))
+                enqueue(sampleBuffer, duration: duration, fetchedAt: generation)
                 #if !os(macOS)
                 if AVAudioSession.sharedInstance().preferredInputNumberOfChannels != channelCount {
                     try? AVAudioSession.sharedInstance().setPreferredOutputNumberOfChannels(Int(channelCount))
@@ -271,7 +375,7 @@ public class AudioRendererPlayer: AudioOutput {
     /// made, or it arrives after the flush and is judged against the new generation.
     ///
     /// - Parameter generation: `anchorGeneration` as it stood before the frames were fetched.
-    private func enqueue(_ sampleBuffer: CMSampleBuffer, fetchedAt generation: Int) {
+    private func enqueue(_ sampleBuffer: CMSampleBuffer, duration: CMTime, fetchedAt generation: Int) {
         let time = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         anchorLock.lock()
         // The frames were pulled out of the track before a flush that has since emptied the
@@ -283,6 +387,12 @@ public class AudioRendererPlayer: AudioOutput {
             return
         }
         renderer.enqueue(sampleBuffer)
+        // A buffer without a usable span cannot be placed against the clock, so it could
+        // neither be handed back nor ever be let go of.
+        let end = time + duration
+        if end.isNumeric {
+            pending.append(Pending(buffer: sampleBuffer, end: end))
+        }
         // Only a loose timebase is owed an anchor, and only a usable timestamp can be one: an
         // unusable one claims nothing and the next buffer gets to try again.
         guard case .loose = anchor, time.isValid, time.isNumeric else {
