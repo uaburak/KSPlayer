@@ -9,21 +9,16 @@ import AVFoundation
 import Foundation
 
 public class AudioRendererPlayer: AudioOutput {
-    /// How far ahead of now the clock is started; 0 starts it on the spot. See `start(at:)`.
-    public static var clockStartLead: TimeInterval = 0.12
-    /// Whether a route change throws the queue away, as it did before `outputDidChange()`
-    /// existed. Kept switchable so the two behaviours can be compared on a real output.
-    public static var flushesOnOutputChange = false
-    /// Whether every `play()` rebuilds the renderer's queue from what the output has kept,
-    /// instead of trusting the renderer to still hold it.
-    public static var resuppliesOnPlay = false
-
     public var playbackRate: Float = 1 {
         didSet {
             // Only a clock that is already tied to the media may be driven directly. While an
             // anchor is still owed the rate is applied together with it; setting it here would
             // start the timebase from wherever it happens to stand. See `Anchor`.
             if !isPaused, isClockAnchored {
+                // The bound below is worked out for the rate the clock was started at.
+                anchorLock.lock()
+                clockStart = nil
+                anchorLock.unlock()
                 synchronizer.rate = playbackRate
             }
         }
@@ -95,6 +90,17 @@ public class AudioRendererPlayer: AudioOutput {
     /// Where the clock stood when playback was paused. See `pause`.
     private var pausedTime: CMTime?
 
+    /// What the clock was last started from, and when. Guarded by `anchorLock`.
+    ///
+    /// The timebase does not take a new time on at once: for some tens of milliseconds after
+    /// `setRate(_:time:)` it still reads what it read before. After a seek backwards that is a
+    /// time far ahead of where the media now is, and whatever is measured against it in that
+    /// moment comes out wrong — buffers only just enqueued count as played and are let go of,
+    /// a pause records a position playback never reached, the video track is told to catch up
+    /// with a clock that is about to step back. The clock cannot have run further than its
+    /// start allows, so for that first moment it is held to that. See `bounded(_:)`.
+    private var clockStart: (time: CMTime, hostTime: CFTimeInterval, rate: Float)?
+
     /// A buffer the renderer has been given, and the media time at which it ends.
     private struct Pending {
         let buffer: CMSampleBuffer
@@ -106,10 +112,9 @@ public class AudioRendererPlayer: AudioOutput {
     ///
     /// The renderer keeps a queue of its own and `request()` feeds it for as long as it will
     /// take more, so it runs ahead of playback by however much the output is willing to hold:
-    /// about a second on a local output, and on a buffered AirPlay route evidently most of
-    /// the forward buffer — returning from the background there skipped twenty to forty-five
-    /// seconds. All of that has already been taken out of the track, and the track cannot
-    /// produce the same frames a second time.
+    /// about a second on a local output, and on a buffered AirPlay route everything the track
+    /// has to give — thirty seconds were measured on a HomePod. All of that has already been
+    /// taken out of the track, and the track cannot produce the same frames a second time.
     ///
     /// So when the renderer loses its queue while the media stays where it is, what it held
     /// has to come from here. Without this list the next buffer to arrive is the one after
@@ -120,6 +125,13 @@ public class AudioRendererPlayer: AudioOutput {
     /// These are the very objects the renderer was given, so keeping them costs no second
     /// copy of the samples while the renderer still holds its own reference.
     private var pending = [Pending]()
+    /// How many of `pending`, counted from the front, the renderer holds. Guarded by
+    /// `anchorLock`.
+    ///
+    /// All of them, as a rule: a buffer joins the list as it is enqueued. `resupply` sets it
+    /// back to none, and `request()` then hands the list over again, in order, before it
+    /// fetches anything new.
+    private var suppliedCount = 0
     private var observers = [NSObjectProtocol]()
     /// Bookkeeping for `diagnostics` only. Guarded by `anchorLock`.
     private var enqueuedCount = 0
@@ -136,6 +148,34 @@ public class AudioRendererPlayer: AudioOutput {
             return true
         }
         return false
+    }
+
+    /// A reading of the timebase, held to what the clock can have reached since it was
+    /// started. `anchorLock` must be held.
+    ///
+    /// Only for the first second after a start. Beyond that the timebase has long settled,
+    /// and over a long stretch it is the host clock this is worked out from that drifts
+    /// against the audio clock, not the other way round.
+    private func bounded(_ time: CMTime) -> CMTime {
+        guard let clockStart else {
+            return time
+        }
+        let elapsed = CACurrentMediaTime() - clockStart.hostTime
+        guard elapsed < 1 else {
+            return time
+        }
+        let reachable = clockStart.time + CMTime(seconds: (elapsed + 0.02) * Double(clockStart.rate), preferredTimescale: 1000)
+        return time > reachable ? reachable : time
+    }
+
+    /// What the periodic observer has read, if the timebase is tied to the media.
+    private func anchored(_ time: CMTime) -> CMTime? {
+        anchorLock.lock()
+        defer { anchorLock.unlock() }
+        guard case .applied = anchor else {
+            return nil
+        }
+        return bounded(time)
     }
 
     public required init() {
@@ -188,7 +228,6 @@ public class AudioRendererPlayer: AudioOutput {
                 KSLog("[audio] synchronizer rate changed to \(self.synchronizer.rate) at \(self.synchronizer.currentTime().seconds), wanted \(self.isPlaying ? "playing" : "paused")")
             }
         })
-        KSLog("[audio] AudioRendererPlayer created, lead=\(Self.clockStartLead) flushesOnOutputChange=\(Self.flushesOnOutputChange) resuppliesOnPlay=\(Self.resuppliesOnPlay)")
 //        if #available(tvOS 15.0, iOS 15.0, macOS 12.0, *) {
 //            renderer.allowedAudioSpatializationFormats = .monoStereoAndMultichannel
 //        }
@@ -209,6 +248,7 @@ public class AudioRendererPlayer: AudioOutput {
         }
         let paused = pausedTime
         let count = pending.count
+        let owed = pending.count - suppliedCount
         let first = pending.first.map { CMSampleBufferGetPresentationTimeStamp($0.buffer) }
         let last = pending.last?.end
         let enqueued = enqueuedCount
@@ -225,7 +265,7 @@ public class AudioRendererPlayer: AudioOutput {
         if #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) {
             text += " sufficient=\(renderer.hasSufficientMediaDataForReliablePlaybackStart)"
         }
-        text += " kept=\(count)[\(first.map(Self.text) ?? "-")..\(last.map(Self.text) ?? "-")]"
+        text += " kept=\(count)[\(first.map(Self.text) ?? "-")..\(last.map(Self.text) ?? "-")] owed=\(owed)"
         text += " ahead=\(lastEnd.isNumeric ? String(format: "%.2f", (lastEnd - clock).seconds) : "-")"
         text += " enqueued=\(enqueued) resupplied=\(resupplies) autoFlush=\(flushes)"
         text += " vol=\(renderer.volume) muted=\(renderer.isMuted)"
@@ -253,8 +293,6 @@ public class AudioRendererPlayer: AudioOutput {
         // enough on some outputs — and a failed renderer plays nothing until it is flushed.
         if renderer.status == .failed {
             resupply(reason: "failed at play: \(String(describing: renderer.error))")
-        } else if Self.resuppliesOnPlay {
-            resupply(reason: "resuppliesOnPlay")
         }
         anchorLock.lock()
         let anchor = self.anchor
@@ -290,7 +328,7 @@ public class AudioRendererPlayer: AudioOutput {
             self.request()
         }
         periodicTimeObserver = synchronizer.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.01), queue: .main) { [weak self] time in
-            guard let self, self.isClockAnchored else {
+            guard let self, let time = self.anchored(time) else {
                 return
             }
             // A timebase that steps backwards is a correction, not playback. Everything
@@ -318,31 +356,22 @@ public class AudioRendererPlayer: AudioOutput {
     /// believes it is far behind and drops frames — a visible stall the moment playback
     /// resumes. Pushing the time through here closes that window.
     ///
-    /// The clock is started a moment ahead of now rather than on the spot. The picture is
-    /// drawn from a display link that has only just been told to run again and takes a few
-    /// frames to deliver its first callback; a clock that starts at once has moved on by then
-    /// and the picture begins that far behind. Where the display runs at the content's own
-    /// frame rate one frame is shown per refresh, so the gap can never be made up — it stays
-    /// as a lip-sync error, grows with every further start, and is only ever cut back by
-    /// dropping frames. Started late, the clock arrives at the next frame's time with the
-    /// display link already running, and the picture is shown on the refresh it is due.
+    /// The clock is started on the spot. Scheduling the start for a host time a moment ahead
+    /// (`setRate(_:time:atHostTime:)`) looks harmless and is not: on a buffered AirPlay route
+    /// a renderer resumed that way while it held its queue never asked for another buffer,
+    /// played nothing, and the next `rate = 0` left the timebase running at 1 — the clock
+    /// went on through the pause and the picture skipped that far ahead when playback
+    /// resumed. That much was observed; the likely reason is that a route with two seconds of
+    /// output latency cannot honour a start a tenth of a second away.
     private func start(at time: CMTime) {
         lastObservedTime = nil
         let before = synchronizer.currentTime()
-        let leadSeconds = Self.clockStartLead
-        guard leadSeconds > 0, #available(macOS 11.3, iOS 14.5, tvOS 14.5, *) else {
-            synchronizer.setRate(playbackRate, time: time)
-            renderSource?.setAudio(time: time, position: -1)
-            KSLog("[audio] CLOCK START at \(Self.text(time)) now, was \(Self.text(before)), reads \(Self.text(synchronizer.currentTime())) rate=\(synchronizer.rate)")
-            return
-        }
-        let lead = CMTime(seconds: leadSeconds, preferredTimescale: 1000)
-        let hostTime = CMClockGetTime(CMClockGetHostTimeClock()) + lead
-        synchronizer.setRate(playbackRate, time: time, atHostTime: hostTime)
-        // Until then the timebase reads short of `time` by what is left of the lead.
-        let behind = CMTime(seconds: leadSeconds * Double(playbackRate), preferredTimescale: 1000)
-        renderSource?.setAudio(time: time - behind, position: -1)
-        KSLog("[audio] CLOCK START at \(Self.text(time)) in \(leadSeconds)s, was \(Self.text(before)), reads \(Self.text(synchronizer.currentTime())) rate=\(synchronizer.rate)")
+        anchorLock.lock()
+        clockStart = (time, CACurrentMediaTime(), playbackRate)
+        anchorLock.unlock()
+        synchronizer.setRate(playbackRate, time: time)
+        renderSource?.setAudio(time: time, position: -1)
+        KSLog("[audio] CLOCK START at \(Self.text(time)), was \(Self.text(before)), reads \(Self.text(synchronizer.currentTime())) rate=\(synchronizer.rate)")
     }
 
     public func pause() {
@@ -359,7 +388,7 @@ public class AudioRendererPlayer: AudioOutput {
         // anchor is merely claimed the timebase still holds its pre-flush value.
         anchorLock.lock()
         if case .applied = anchor {
-            pausedTime = synchronizer.currentTime()
+            pausedTime = bounded(synchronizer.currentTime())
         } else {
             pausedTime = nil
         }
@@ -389,8 +418,10 @@ public class AudioRendererPlayer: AudioOutput {
         anchor = .loose
         anchorGeneration &+= 1
         pausedTime = nil
+        clockStart = nil
         // The media has moved: what the renderer held belongs to the position it left.
         pending.removeAll()
+        suppliedCount = 0
         anchorLock.unlock()
     }
 
@@ -399,37 +430,48 @@ public class AudioRendererPlayer: AudioOutput {
     /// Nothing is thrown away here. The renderer follows a route change by itself, and when
     /// that costs it its queue it posts the notification `resupply()` answers. Flushing on
     /// top of that — which is what every route change used to do — discarded the queue with
-    /// nothing to refill it from, and a route change is exactly what the audio session
-    /// reports when an app returns from the background.
+    /// nothing to refill it from.
     public func outputDidChange() {
-        if Self.flushesOnOutputChange {
-            flush()
-        } else {
-            KSLog("[audio] output changed, queue kept | \(diagnostics)")
-        }
+        KSLog("[audio] output changed, queue kept | \(diagnostics)")
     }
 
-    /// Gives the renderer back what it no longer holds, without moving the media.
+    /// Empties the renderer and gives it back what it held, without moving the media.
     ///
-    /// The clock is left alone: it stands, or keeps running, where the media is, and the
-    /// buffers handed back carry the timestamps they always had. The renderer picks up at the
-    /// clock's position, so all that is heard is the moment it needs to start again.
+    /// For when the renderer has lost its queue, or cannot be trusted to still have it: the
+    /// system flushes it when the app goes to the background and interrupts the audio session
+    /// on top of that. To the renderer this is the same as a seek — flushed, refilled, and the
+    /// clock started from the first buffer it is given — the one sequence that has been seen
+    /// to play on every output. The difference is where the refill comes from: not from the
+    /// track, which has long moved past these frames, but from `pending`. The first buffer
+    /// handed back is the one playback stood in, so the clock starts again within one
+    /// buffer's length of where it stopped and nothing is skipped.
     public func resupply() {
         resupply(reason: "requested")
     }
 
     private func resupply(reason: String) {
+        // Where playback stands has to be read while the clock still says so.
         anchorLock.lock()
-        // Clears a failed status as well, and anything enqueued since the queue was lost:
-        // the renderer takes buffers in presentation order only.
-        renderer.flush()
         dropPlayed()
-        for item in pending {
-            renderer.enqueue(item.buffer)
-        }
+        anchorLock.unlock()
+        // Stopped for the same reason as in `flush`: the renderer is about to be empty.
+        synchronizer.rate = 0
+        anchorLock.lock()
+        // Clears a failed status as well.
+        renderer.flush()
+        anchor = .loose
+        pausedTime = nil
+        clockStart = nil
+        suppliedCount = 0
         resupplyCount += 1
         anchorLock.unlock()
         KSLog("[audio] RESUPPLY (\(reason)) | \(diagnostics)")
+        // Nothing says the renderer asks again by itself after being flushed mid-playback.
+        if isPlaying {
+            serializationQueue.async { [weak self] in
+                self?.request()
+            }
+        }
     }
 
     /// Lets go of the buffers the clock has passed. `anchorLock` must be held.
@@ -438,10 +480,11 @@ public class AudioRendererPlayer: AudioOutput {
         guard case .applied = anchor, !pending.isEmpty else {
             return
         }
-        let position = pausedTime ?? synchronizer.currentTime()
+        let position = pausedTime ?? bounded(synchronizer.currentTime())
         let played = pending.prefix { $0.end <= position }.count
         if played > 0 {
             pending.removeFirst(played)
+            suppliedCount = max(0, suppliedCount - played)
         }
     }
 
@@ -451,11 +494,25 @@ public class AudioRendererPlayer: AudioOutput {
             resupply(reason: "failed in request: \(String(describing: renderer.error))")
         }
         while renderer.isReadyForMoreMediaData, !isPaused {
+            anchorLock.lock()
+            dropPlayed()
+            if suppliedCount < pending.count {
+                // The renderer lost what it held (`resupply`). It gets that back before
+                // anything new: it takes buffers in presentation order only.
+                let buffer = pending[suppliedCount].buffer
+                renderer.enqueue(buffer)
+                suppliedCount += 1
+                let time = CMSampleBufferGetPresentationTimeStamp(buffer)
+                let claim = claimAnchor(at: time)
+                anchorLock.unlock()
+                if let claim {
+                    schedule(claim: claim, at: time)
+                }
+                continue
+            }
             // Taken before the frames are fetched: a flush between here and the enqueue means
             // they belong to the position the media has just left.
-            anchorLock.lock()
             let generation = anchorGeneration
-            dropPlayed()
             anchorLock.unlock()
             guard var render = renderSource?.getAudioOutputRender() else {
                 break
@@ -487,7 +544,8 @@ public class AudioRendererPlayer: AudioOutput {
         }
     }
 
-    /// Enqueues one buffer and, while the timebase is still loose, claims the anchor for it.
+    /// Enqueues one buffer fresh out of the track and, while the timebase is still loose,
+    /// claims the anchor for it.
     ///
     /// Everything happens under `anchorLock`, which `flush` takes as well. That makes the
     /// ordering between the two total: a buffer is either flushed away along with the claim it
@@ -505,7 +563,10 @@ public class AudioRendererPlayer: AudioOutput {
             anchorLock.unlock()
             return
         }
-        renderer.enqueue(sampleBuffer)
+        // `resupply` can have emptied the renderer since these frames were fetched. They are
+        // out of the track for good, so they are not dropped for that: they join the list and
+        // reach the renderer in their turn.
+        let isOwedEarlier = suppliedCount < pending.count
         // A buffer without a usable span cannot be placed against the clock, so it could
         // neither be handed back nor ever be let go of.
         let end = time + duration
@@ -514,16 +575,37 @@ public class AudioRendererPlayer: AudioOutput {
             lastEnqueuedEnd = end
         }
         enqueuedCount += 1
-        // Only a loose timebase is owed an anchor, and only a usable timestamp can be one: an
-        // unusable one claims nothing and the next buffer gets to try again.
-        guard case .loose = anchor, time.isValid, time.isNumeric else {
+        guard !isOwedEarlier else {
             anchorLock.unlock()
             return
         }
+        renderer.enqueue(sampleBuffer)
+        if end.isNumeric {
+            suppliedCount += 1
+        }
+        let claim = claimAnchor(at: time)
+        anchorLock.unlock()
+        if let claim {
+            schedule(claim: claim, at: time)
+        }
+    }
+
+    /// Claims the anchor for a buffer that has just been enqueued, if the timebase is owed
+    /// one. `anchorLock` must be held.
+    ///
+    /// - Returns: the generation the claim was made under, or nil if none was made.
+    private func claimAnchor(at time: CMTime) -> Int? {
+        // Only a loose timebase is owed an anchor, and only a usable timestamp can be one: an
+        // unusable one claims nothing and the next buffer gets to try again.
+        guard case .loose = anchor, time.isValid, time.isNumeric else {
+            return nil
+        }
         anchor = .claimed(time)
         anchorGeneration &+= 1
-        let claim = anchorGeneration
-        anchorLock.unlock()
+        return anchorGeneration
+    }
+
+    private func schedule(claim: Int, at time: CMTime) {
         KSLog("[audio] anchor claimed at \(Self.text(time)) by the first buffer after a flush")
         runOnMainThread { [weak self] in
             self?.applyAnchor(claimedAt: claim)
