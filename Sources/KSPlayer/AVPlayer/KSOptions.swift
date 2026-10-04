@@ -84,6 +84,9 @@ open class KSOptions {
     public var syncDecodeVideo = false
     public var hardwareDecode = KSOptions.hardwareDecode
     public var asynchronousDecompression = KSOptions.asynchronousDecompression
+    /// Whether the video track keeps the packets of the GOP it is decoding, so that its
+    /// decoder can be rebuilt in the middle of one. See `KSMEPlayer.suspendVideoDecoding()`.
+    public var isVideoDecoderRebuildable = false
     public var videoDisable = false
     public var canStartPictureInPictureAutomaticallyFromInline = KSOptions.canStartPictureInPictureAutomaticallyFromInline
     public var automaticWindowResize = true

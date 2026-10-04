@@ -33,6 +33,26 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
         }
     }
 
+    /// The packets given to the decoder since the last keyframe, that keyframe first. Only
+    /// kept for video, and only with `KSOptions.isVideoDecoderRebuildable`; touched on the
+    /// decoding thread alone. See `suspendDecoding()`.
+    private var gop = [Packet]()
+    private var gopBytes = 0
+    /// False from the moment a GOP outgrows what is worth keeping until the next keyframe.
+    private var gopIsWhole = false
+    /// `gop.count`, readable from any thread.
+    private(set) var gopPacketCount = 0
+    /// Where the newest frame handed on ends, in seconds: what a rebuilt decoder must not
+    /// produce a second time.
+    private var deliveredUntil = 0.0
+    /// Guards the two flags below, which are set on the main thread and read while decoding.
+    private let rebuildLock = NSCondition()
+    private var isDecodingSuspended = false
+    private var decoderIsLost = false
+    private var keepsGOP: Bool {
+        mediaType == .video && options.isVideoDecoderRebuildable
+    }
+
     var isEndOfFile: Bool = false
     var packetCount: Int { 0 }
     let description: String
@@ -79,11 +99,13 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
         state = .flush
         outputRenderQueue.flush()
         isLoopModel = false
+        wakeDecoding()
     }
 
     func putPacket(packet: Packet) {
         if state == .flush {
             decoderMap.values.forEach { $0.doFlushCodec() }
+            forgetGOP()
             state = .decoding
         }
         if state == .decoding {
@@ -107,12 +129,145 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
         }
         state = .closed
         outputRenderQueue.shutdown()
+        wakeDecoding()
+    }
+
+    // MARK: Rebuilding the decoder
+
+    /// Nothing more is given to the decoder until `resumeDecoding()`.
+    ///
+    /// For the app's time in the background. A hardware decoder works through a session that
+    /// the system takes away there, and everything the decoder had built up goes with it: the
+    /// frames a GOP's later pictures are predicted from. Back in the foreground the next
+    /// packets cannot be decoded — the picture stands still until the next keyframe comes
+    /// round, while the sound runs on. Seconds, in a stream with long GOPs.
+    ///
+    /// So the track keeps the packets of the GOP it is in (`gop`). When decoding resumes the
+    /// old decoder is thrown away, a new one is fed those packets again, and the frames that
+    /// had already been handed on are discarded as they come out a second time. Decoding then
+    /// carries on with the packet it had stopped at, and not a frame is missing.
+    ///
+    /// Holding the decoder back in the meantime is part of it. A packet it is given while it
+    /// has no session is a packet lost, and with enough of them the GOP kept here is no longer
+    /// the one playback stands in.
+    func suspendDecoding() {
+        guard keepsGOP else { return }
+        rebuildLock.lock()
+        isDecodingSuspended = true
+        rebuildLock.unlock()
+        KSLog("[video] decoding suspended, \(gopPacketCount) packets kept since the last keyframe")
+    }
+
+    /// Decoding carries on, with a new decoder. See `suspendDecoding()`.
+    func resumeDecoding() {
+        rebuildLock.lock()
+        let wasSuspended = isDecodingSuspended
+        isDecodingSuspended = false
+        if wasSuspended {
+            decoderIsLost = true
+        }
+        rebuildLock.broadcast()
+        rebuildLock.unlock()
+        if wasSuspended {
+            KSLog("[video] decoding resumed, the decoder is rebuilt before the next packet")
+            // The decoding thread is most likely parked in `push`, waiting for the render
+            // queue to empty by half, and playback has not started yet. Let out now, it has
+            // the decoder rebuilt and caught up while the frames already queued are shown.
+            outputRenderQueue.wake()
+        }
+    }
+
+    /// Blocks the decoding thread while decoding is suspended. A seek or a shutdown ends the
+    /// wait: both change `state`, and the caller looks at it again afterwards.
+    fileprivate func waitWhileSuspended() {
+        rebuildLock.lock()
+        while isDecodingSuspended, state == .decoding {
+            rebuildLock.wait()
+        }
+        rebuildLock.unlock()
+    }
+
+    private func wakeDecoding() {
+        rebuildLock.lock()
+        rebuildLock.broadcast()
+        rebuildLock.unlock()
+    }
+
+    /// The decoder has been flushed or is gone: what was kept for it means nothing any more.
+    fileprivate func forgetGOP() {
+        gop.removeAll(keepingCapacity: true)
+        gopBytes = 0
+        gopIsWhole = false
+        gopPacketCount = 0
+        deliveredUntil = 0
+    }
+
+    private func remember(_ packet: Packet) {
+        if let first = gop.first, first.assetTrack !== packet.assetTrack {
+            // Another video track: its decoder starts from its own keyframe.
+            gop.removeAll(keepingCapacity: true)
+            gopBytes = 0
+            gopIsWhole = false
+        }
+        if packet.isKeyFrame {
+            gop.removeAll(keepingCapacity: true)
+            gopBytes = 0
+            gopIsWhole = true
+        }
+        if gopIsWhole {
+            gop.append(packet)
+            gopBytes += Int(packet.size)
+            // A GOP this long is not worth holding on to. A rebuild inside it waits for the
+            // next keyframe, as every rebuild used to.
+            if gop.count > 1800 || gopBytes > 64 << 20 {
+                gop.removeAll()
+                gopBytes = 0
+                gopIsWhole = false
+            }
+        }
+        gopPacketCount = gop.count
+    }
+
+    private func rebuildDecoderIfLost() {
+        rebuildLock.lock()
+        let isLost = decoderIsLost
+        decoderIsLost = false
+        rebuildLock.unlock()
+        guard isLost else { return }
+        decoderMap.values.forEach { $0.shutdown() }
+        decoderMap.removeAll()
+        guard let assetTrack = gop.first?.assetTrack else {
+            KSLog("[video] decoder rebuilt with nothing to replay, the picture resumes at the next keyframe")
+            return
+        }
+        // What the old decoder had produced is in the render queue or has been shown. The
+        // accurate-seek filter drops everything up to there as it comes out again.
+        if deliveredUntil > 0 {
+            seekTime = max(seekTime, deliveredUntil + 0.001)
+            let decoder = makeDecode(assetTrack: assetTrack)
+            (decoder as? FFmpegDecode)?.captionsResumeAfter = deliveredUntil
+            decoderMap[assetTrack.trackID] = decoder
+        }
+        let began = CACurrentMediaTime()
+        var replayed = 0
+        for packet in gop {
+            guard state == .decoding else { break }
+            feed(packet)
+            replayed += 1
+        }
+        KSLog("[video] decoder rebuilt, \(replayed) of \(gop.count) packets replayed in \(Int((CACurrentMediaTime() - began) * 1000)) ms, frames resume after \(String(format: "%.3f", deliveredUntil))")
     }
 
     private var lastPacketBytes = Int32(0)
     private var lastPacketSeconds = Double(-1)
     var bitrate = Double(0)
     fileprivate func doDecode(packet: Packet) {
+        if keepsGOP {
+            rebuildDecoderIfLost()
+            // Before it is decoded: a packet the decoder fails on is one a rebuild has to
+            // replay as well.
+            remember(packet)
+        }
         if packet.isKeyFrame, packet.assetTrack.mediaType != .subtitle {
             let seconds = packet.seconds
             let diff = seconds - lastPacketSeconds
@@ -127,6 +282,17 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
             }
         }
         lastPacketBytes += packet.size
+        feed(packet)
+        if options.decodeAudioTime == 0, mediaType == .audio {
+            options.decodeAudioTime = CACurrentMediaTime()
+        }
+        if options.decodeVideoTime == 0, mediaType == .video {
+            options.decodeVideoTime = CACurrentMediaTime()
+        }
+    }
+
+    /// Gives one packet to its decoder and passes on what comes out.
+    private func feed(_ packet: Packet) {
         let decoder = decoderMap.value(for: packet.assetTrack.trackID, default: makeDecode(assetTrack: packet.assetTrack))
 //        var startTime = CACurrentMediaTime()
         decoder.decodeFrame(from: packet) { [weak self] result in
@@ -152,6 +318,15 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
                     }
                 }
                 if let frame = frame as? Frame {
+                    if self.keepsGOP {
+                        // The thread can have been let out of `push` with the queue still
+                        // full (`resumeDecoding()`).
+                        self.outputRenderQueue.waitForSpace()
+                        if self.state == .flush || self.state == .closed {
+                            return
+                        }
+                        self.deliveredUntil = frame.timebase.cmtime(for: frame.timestamp + frame.duration).seconds
+                    }
                     self.outputRenderQueue.push(frame)
                     self.outputRenderQueue.fps = packet.assetTrack.nominalFrameRate
                 }
@@ -161,17 +336,11 @@ class SyncPlayerItemTrack<Frame: MEFrame>: PlayerItemTrackProtocol, CustomString
                     decoder.shutdown()
                     self.decoderMap[packet.assetTrack.trackID] = FFmpegDecode(assetTrack: packet.assetTrack, options: self.options)
                     KSLog("VideoCodec switch to software decompression")
-                    self.doDecode(packet: packet)
+                    self.feed(packet)
                 } else {
                     self.state = .failed
                 }
             }
-        }
-        if options.decodeAudioTime == 0, mediaType == .audio {
-            options.decodeAudioTime = CACurrentMediaTime()
-        }
-        if options.decodeVideoTime == 0, mediaType == .video {
-            options.decodeVideoTime = CACurrentMediaTime()
         }
     }
 }
@@ -241,15 +410,22 @@ final class AsyncPlayerItemTrack<Frame: MEFrame>: SyncPlayerItemTrack<Frame> {
             case .finished, .closed, .failed:
                 decoderMap.values.forEach { $0.shutdown() }
                 decoderMap.removeAll()
+                forgetGOP()
                 break outerLoop
             case .flush:
                 decoderMap.values.forEach { $0.doFlushCodec() }
+                forgetGOP()
                 state = .decoding
             case .decoding:
                 if isEndOfFile, packetQueue.count == 0 {
                     state = .finished
                 } else {
                     guard let packet = packetQueue.pop(wait: true), state != .flush, state != .closed else {
+                        continue
+                    }
+                    waitWhileSuspended()
+                    // A seek or a shutdown during the wait: the packet belongs to what was left.
+                    guard state == .decoding else {
                         continue
                     }
                     autoreleasepool {

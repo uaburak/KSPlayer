@@ -69,7 +69,19 @@ public final class MEPlayerItem: Sendable {
         for track in videoAudioTracks {
             text += " \(track.mediaType == .audio ? "a" : "v")[frames=\(track.frameCount)/\(track.frameMaxCount) packets=\(track.packetCount) eof=\(track.isEndOfFile)]"
         }
+        if let videoTrack, options.isVideoDecoderRebuildable {
+            text += " gop=\(videoTrack.gopPacketCount)"
+        }
         return text
+    }
+
+    /// See `SyncPlayerItemTrack.suspendDecoding()`.
+    func suspendVideoDecoding() {
+        videoTrack?.suspendDecoding()
+    }
+
+    func resumeVideoDecoding() {
+        videoTrack?.resumeDecoding()
     }
 
     private var state = MESourceState.idle {

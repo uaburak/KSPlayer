@@ -114,6 +114,25 @@ public class CircularBuffer<Item: ObjectQueueItem> {
         }
     }
 
+    /// Blocks while there is no room for another item. For a buffer that does not expand.
+    ///
+    /// `push` waits after it has taken the last free place, not before. Whoever is let out of
+    /// that wait early (`wake()`) must therefore not push again until there is room.
+    public func waitForSpace() {
+        condition.lock()
+        defer { condition.unlock() }
+        while !destroyed, !expanding, _count >= maxCount {
+            condition.wait()
+        }
+    }
+
+    /// Lets whoever is waiting in `push` or `waitForSpace` look again.
+    public func wake() {
+        condition.lock()
+        condition.broadcast()
+        condition.unlock()
+    }
+
     public func search(where predicate: (Item) -> Bool) -> [Item] {
         condition.lock()
         defer { condition.unlock() }

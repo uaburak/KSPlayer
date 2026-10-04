@@ -17,6 +17,13 @@ class FFmpegDecode: DecodeProtocol {
     private let frameChange: FrameChange
     private let filter: MEFilter
     private let seekByBytes: Bool
+    /// Captions are not passed on for frames that end at or before this time, in seconds.
+    ///
+    /// Set on a decoder that is first fed packets its predecessor had been given already
+    /// (`SyncPlayerItemTrack.suspendDecoding()`). The captions those frames carry went out the
+    /// first time round, and the caption decoder keeps state: given the same bytes twice it
+    /// writes the same words twice.
+    var captionsResumeAfter = 0.0
     required init(assetTrack: FFmpegAssetTrack, options: KSOptions) {
         self.options = options
         seekByBytes = assetTrack.seekByBytes
@@ -67,7 +74,8 @@ class FFmpegDecode: DecodeProtocol {
                         if let sideData = inputFrame.pointee.side_data[Int(i)]?.pointee {
                             if sideData.type == AV_FRAME_DATA_A53_CC {
                                 if let closedCaptionsTrack = packet.assetTrack.closedCaptionsTrack,
-                                   let subtitle = closedCaptionsTrack.subtitle
+                                   let subtitle = closedCaptionsTrack.subtitle,
+                                   !isRepeated(inputFrame, of: packet.assetTrack)
                                 {
                                     let closedCaptionsPacket = Packet()
                                     if let corePacket = packet.corePacket {
@@ -183,6 +191,14 @@ class FFmpegDecode: DecodeProtocol {
                 }
             }
         }
+    }
+
+    /// Whether the frame is one the previous decoder had produced. See `captionsResumeAfter`.
+    private func isRepeated(_ frame: UnsafeMutablePointer<AVFrame>, of assetTrack: FFmpegAssetTrack) -> Bool {
+        guard captionsResumeAfter > 0 else { return false }
+        let timestamp = frame.pointee.best_effort_timestamp
+        guard timestamp >= 0 else { return false }
+        return assetTrack.timebase.cmtime(for: timestamp + frame.pointee.duration).seconds < captionsResumeAfter + 0.001
     }
 
     func doFlushCodec() {

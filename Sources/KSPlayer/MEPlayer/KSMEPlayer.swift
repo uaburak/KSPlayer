@@ -454,6 +454,21 @@ extension KSMEPlayer: MediaPlayerProtocol {
 
     public func enterForeground() {}
 
+    /// Stops feeding the video decoder until `resumeVideoDecoding()`, which rebuilds it.
+    ///
+    /// For the app's time in the background, where a hardware decoder loses its session: call
+    /// this on the way out and `resumeVideoDecoding()` on the way back. With
+    /// `KSOptions.isVideoDecoderRebuildable` the picture then carries on from the frame it
+    /// stopped at instead of standing still until the next keyframe; without it both calls do
+    /// nothing. See `SyncPlayerItemTrack.suspendDecoding()`.
+    public func suspendVideoDecoding() {
+        playerItem.suspendVideoDecoding()
+    }
+
+    public func resumeVideoDecoding() {
+        playerItem.resumeVideoDecoding()
+    }
+
     /// Everything that decides what is seen and heard right now, in one line, for logs.
     public var diagnostics: String {
         var text = "playback=\(playbackState) load=\(loadState) pos=\(String(format: "%.3f", currentPlaybackTime)) playable=\(String(format: "%.1f", playableTime))"
